@@ -76,8 +76,6 @@ final class CarbitLinkOutput {
     private var pendingFrame: Data?
     private var frameInFlight = false
     private var dumpHandle: FileHandle?
-    /// mDNS 浏览器：从 `_EasyConn._tcp` 的 TXT 记录里取仪表真实的 huid 与端口。
-    private var browser: NWBrowser?
     /// 上一次上报给 UI 的连接状态。只在真实跃变时回调，
     /// 避免 stop() 每次都报一次"已断开"（日志里会和 Receiver stopped 成对出现，纯噪声）。
     private var reportedConnected = false
@@ -111,17 +109,11 @@ final class CarbitLinkOutput {
         }
         isRunning = true
         log("开始连接仪表 \(config.host)，控制端口候选 \(portList(config.controlPorts))")
-        // 先开 mDNS 窗口再看连：仪表的 huid 只在 TXT 里，握手空着等于没报名。
-        startDiscoveryLocked()
-        queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self, self.isRunning, self.control == nil else { return }
-            self.connectControlResetting()
-        }
+        connectControlResetting()
     }
 
     private func stopLocked() {
         isRunning = false
-        browser?.cancel(); browser = nil
         control?.cancel(); control = nil
         data?.cancel(); data = nil
         parsers.removeAll()
@@ -363,54 +355,6 @@ final class CarbitLinkOutput {
         let created = CarbitLinkWire()
         parsers[key] = created
         return created
-    }
-
-    // MARK: - mDNS 发现
-    //
-    // 实车暴露的问题：握手发出去是 {"HUName":"","HUID":""}，两个字段都空。
-    // HUID 是仪表的 MAC，iOS 拿不到 Wi-Fi MAC，但仪表自己在 `_EasyConn._tcp`
-    // 的 TXT 里报了 huid / port / flavor / channel —— 这是唯一可靠来源。
-
-    private func startDiscoveryLocked() {
-        browser?.cancel(); browser = nil
-        let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = true
-        let browser = NWBrowser(for: .bonjour(type: "_EasyConn._tcp", domain: nil), using: parameters)
-        browser.stateUpdateHandler = { [weak self] state in
-            if case let .failed(error) = state {
-                self?.log("mDNS 浏览失败：\(error.localizedDescription)")
-            }
-        }
-        let handler: (Set<NWBrowser.Result>, Set<NWBrowser.Result.Change>) -> Void = { [weak self] results, _ in
-            guard let self else { return }
-            for result in results {
-                var detail = ""
-                let txtRecord: NWTXTRecord? = {
-                    if case let .bonjour(record) = result.metadata { return record }
-                    return nil
-                }()
-                if let txtRecord {
-                    let records: [String: String] = txtRecord.dictionary
-                    let info = CarbitLinkWire.parseTXT(records)
-                    detail = " TXT{huid=\(info.huid) port=\(info.port) flavor=\(info.flavor) channel=\(info.channel)}"
-                    if !info.huid.isEmpty, self.config.huid.isEmpty {
-                        self.config.huid = info.huid
-                        self.log("mDNS 取到 huid=\(info.huid)（\(CarbitLinkWire.formatHUID(info.huid))），握手将带上")
-                    }
-                }
-                self.log("mDNS 发现服务 \(result.endpoint)\(detail)")
-                // 服务实例名一般就是仪表的 HUName（对照 Android 抓包里的 "ufCX"）。
-                if case let NWEndpoint.service(name, _, _) = result.endpoint {
-                    if self.config.huName.isEmpty, !name.isEmpty {
-                        self.config.huName = name
-                        self.log("mDNS 取到 HUName=\(name)")
-                    }
-                }
-            }
-        }
-        browser.browseResultsChangedHandler = handler
-        browser.start(queue: queue)
-        self.browser = browser
     }
 
     // MARK: - 工具
