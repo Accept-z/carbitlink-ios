@@ -30,7 +30,11 @@ jobs:
         run: |
           echo "HEAD = $(git rev-parse HEAD)"
           echo "CarbitLinkOutput.swift md5 = $(md5 -q App/CarbitLinkOutput.swift)"
-          echo "HUID 出现次数 = $(grep -c '5478C9665F12' App/CarbitLinkOutput.swift || true)"
+          echo "CarbitLinkIdentity.swift md5 = $(md5 -q App/CarbitLinkIdentity.swift)"
+          echo "[v0.8] rsaSignatureRaw = $(grep -c 'rsaSignatureRaw' App/CarbitLinkIdentity.swift || true)"
+          echo "[v0.8] carClientInfoReply = $(grep -c 'carClientInfoReply' App/CarbitLinkWire.swift || true)"
+          echo "[v0.8] 静默等待首帧 = $(grep -c '先静默等待车机首帧' App/CarbitLinkOutput.swift || true)"
+          echo "[v0.8] sn=ehCs = $(grep -c '"ehCs"' App/CarbitLinkOutput.swift || true)"
           echo "allowLocalEndpointReuse = $(grep -c 'allowLocalEndpointReuse' App/CarbitLinkOutput.swift || true)"
 
       - name: 环境信息
