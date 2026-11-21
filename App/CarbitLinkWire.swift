@@ -205,7 +205,13 @@ final class CarbitLinkWire {
     private static func classify(low16: UInt16, fullCode: UInt32, payload: Data, framing: Framing, version: UInt32) -> [Event] {
         switch low16 {
         case 0x0010:
-            return [.start(decodeMirrorConfig(payload))]
+            // CLIENT_INFO（仪表能力上报）是 JSON；只有真解析出 protobuf 采集参数才算 start。
+            let cfg = decodeMirrorConfig(payload)
+            if let cfg { return [.start(cfg)] }
+            if payload.first == UInt8(ascii: "{") {
+                return [.unknown(code: fullCode, payload: payload, framing: framing)]
+            }
+            return [.start(nil)]
         case MirrorCode.ready.rawValue:
             return [.ready]
         case MirrorCode.frameRequest.rawValue:
