@@ -58,6 +58,8 @@
 		EE2B1903011E5622285F4D96 /* Sources/TDSCarKitCore/AnnexB.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCDB68396E988831E68111F /* Sources/TDSCarKitCore/AnnexB.swift */; };
 		F18EC0E491B6E27F5FB2FFCA /* App/CarPlayAudio.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF3A69A086EFDEE36CFCEF7B /* App/CarPlayAudio.swift */; };
 		FD04C6B75D83204140C4DEEA /* App/DirectAccessoryTransport.m in Sources */ = {isa = PBXBuildFile; fileRef = 43A08A842E89C864862B3AB0 /* App/DirectAccessoryTransport.m */; };
+		C7A1B2D3E4F50617283940B1 /* App/CarbitLinkWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7A1B2D3E4F50617283940A1 /* App/CarbitLinkWire.swift */; };
+		C7A1B2D3E4F50617283940B2 /* App/CarbitLinkOutput.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7A1B2D3E4F50617283940A2 /* App/CarbitLinkOutput.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -113,6 +115,8 @@
 		F726A65F45AF199AB43C5211 /* Sources/TDSCarKitCore/Vendor/BigInt/Division.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/TDSCarKitCore/Vendor/BigInt/Division.swift; sourceTree = "<group>"; };
 		FA8531A1754681DF650ED717 /* Sources/TDSCarKitCore/BLEFrame.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/TDSCarKitCore/BLEFrame.swift; sourceTree = "<group>"; };
 		FEB6265A3FB950679A3B4841 /* Sources/CTDSCarKitCrypto/TDSCarKitCrypto.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = Sources/CTDSCarKitCrypto/TDSCarKitCrypto.c; sourceTree = "<group>"; };
+		C7A1B2D3E4F50617283940A1 /* App/CarbitLinkWire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/CarbitLinkWire.swift; sourceTree = "<group>"; };
+		C7A1B2D3E4F50617283940A2 /* App/CarbitLinkOutput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/CarbitLinkOutput.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -136,6 +140,8 @@
 				A14BC9A1582FB7301EBA4EEC /* App/CarPlayControlBrowser.swift */,
 				53BD38A08293BBCCBC182639 /* App/CarPlayInfo.swift */,
 				16E2A38BC8A7D4D0FB884AB6 /* App/CarPlayMediaSession.swift */,
+				C7A1B2D3E4F50617283940A1 /* App/CarbitLinkWire.swift */,
+				C7A1B2D3E4F50617283940A2 /* App/CarbitLinkOutput.swift */,
 				43A08A842E89C864862B3AB0 /* App/DirectAccessoryTransport.m */,
 				59DB484630DAD05A9DD9EA6F /* App/H264Surface.swift */,
 				07F56AF5C64640432F486F25 /* App/MediaSockets.swift */,
@@ -261,6 +267,8 @@
 				4EC2B9A0957C0C7BA4C4D577 /* App/CarPlayControlBrowser.swift in Sources */,
 				E01EB6CB915B5F55F78F8DB6 /* App/CarPlayInfo.swift in Sources */,
 				D3B8F6FD49FB4AC811675FEB /* App/CarPlayMediaSession.swift in Sources */,
+				C7A1B2D3E4F50617283940B1 /* App/CarbitLinkWire.swift in Sources */,
+				C7A1B2D3E4F50617283940B2 /* App/CarbitLinkOutput.swift in Sources */,
 				FD04C6B75D83204140C4DEEA /* App/DirectAccessoryTransport.m in Sources */,
 				0EC86F455714F97754ED72C4 /* App/H264Surface.swift in Sources */,
 				131430C6B0DCC43DDBA29FCD /* App/MediaSockets.swift in Sources */,

@@ -1,0 +1,71 @@
+name: build-unsigned-ipa
+
+# 用途：这台机器是 Windows，没有 Xcode。推到 GitHub 后由 macOS runner 编译出
+# 未签名 IPA，再用 Sideloadly 侧载（流程与 CarWithin 完全一致）。
+#
+# 一次性准备：
+#   1. 本仓库 push 到你自己的 GitHub 私有仓库
+#   2. 把 .local/Identity 下三个文件做成一个 secret：
+#        macOS/Linux:  base64 -i certificate.p7b | tr -d '\n'   （三个文件分别做太麻烦，
+#                      用下面的打包方式更省事）
+#        推荐：在 tds-car-kit 根目录执行
+#          tar czf identity.tgz -C .local Identity && base64 -i identity.tgz | tr -d '\n' | pbcopy
+#        把结果存成仓库 secret：Settings → Secrets → Actions → 新建 IDENTITY_TGZ_B64
+#   3. 没有 secret 也能编译（.local/Identity 为空时上游仍可构建，只是收不到 CarPlay）
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 还原鉴权证书（可选）
+        env:
+          IDENTITY_TGZ_B64: ${{ secrets.IDENTITY_TGZ_B64 }}
+        run: |
+          mkdir -p .local/Identity
+          if [ -n "$IDENTITY_TGZ_B64" ]; then
+            echo "$IDENTITY_TGZ_B64" | base64 -d > /tmp/identity.tgz
+            tar xzf /tmp/identity.tgz -C .local
+            ls -l .local/Identity
+          else
+            echo "未提供 IDENTITY_TGZ_B64，使用空 Identity 目录（可编译，但接收端无法完成配件认证）"
+          fi
+
+      - name: 编译（关闭签名）
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project TDSCarKit.xcodeproj \
+            -scheme TDSCarKit \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            build 2>&1 | tail -60
+
+      - name: 打包未签名 IPA
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "找到 app: $APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry TDSCarKit-unsigned.ipa Payload
+          ls -lh TDSCarKit-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TDSCarKit-unsigned-ipa
+          path: out/TDSCarKit-unsigned.ipa
+          retention-days: 14

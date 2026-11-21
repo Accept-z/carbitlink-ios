@@ -27,11 +27,16 @@
 		<string>_airplay._tcp</string>
 		<string>_tds-carkit._tcp</string>
 		<string>_carplay-ctrl._tcp</string>
+		<string>_EasyConn._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Receive CarPlay control and media from your iPhone on this network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Return microphone audio to the iPhone for Siri and calls.</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

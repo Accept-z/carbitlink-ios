@@ -44,6 +44,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private let connectionHelp = UILabel()
     private let logView = UITextView()
     private let videoSurface = H264Surface()
+    /// 亿连（CarbitLink）仪表输出插件。CarPlay 帧的第五个出口。
+    private let carbitLink = CarbitLinkOutput()
+    private let carbitLinkSwitch = UISwitch()
+    private let carbitHostField = UITextField()
     private let fullscreenButton = UIButton(type: .system)
     private let forgetPasswordButton = UIButton(type: .system)
     private let passwordStatus = UILabel()
@@ -136,6 +140,21 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         hotspotNote.font = .preferredFont(forTextStyle: .footnote); hotspotNote.textColor = .secondaryLabel; hotspotNote.numberOfLines = 0
         hotspotNote.text = "For iPhone hotspot: enable Personal Hotspot in Settings and connect the iPad to it. Keep a Wi-Fi profile saved here for the CarPlay handshake. Hotspot passwords are managed by iOS."
         settingsStack.addArrangedSubview(hotspotNote)
+        // 亿连仪表输出（实验）。仪表加入同一网络后用其网关地址连接。
+        carbitLinkSwitch.isOn = UserDefaults.standard.bool(forKey: "carbitLinkEnabled")
+        carbitHostField.placeholder = "仪表 IP（连上仪表热点后填网关，如 192.168.49.1）"
+        carbitHostField.keyboardType = .decimalPad
+        carbitHostField.borderStyle = .roundedRect
+        carbitHostField.text = UserDefaults.standard.string(forKey: "carbitLinkHost") ?? ""
+        let carbitTitle = UILabel(); carbitTitle.text = "亿连仪表输出（实验）"
+        carbitTitle.font = .preferredFont(forTextStyle: .footnote)
+        let carbitRow = UIStackView(arrangedSubviews: [carbitTitle, carbitLinkSwitch]); carbitRow.spacing = 12
+        let carbitNote = UILabel(); carbitNote.numberOfLines = 0
+        carbitNote.font = .preferredFont(forTextStyle: .caption1); carbitNote.textColor = .secondaryLabel
+        carbitNote.text = "不改写视频，只多开一路输出给亿连仪表。原始字节会写入 Documents/carbitlink-dump.log。"
+        let carbitBox = UIStackView(arrangedSubviews: [carbitRow, carbitHostField, carbitNote])
+        carbitBox.axis = .vertical; carbitBox.spacing = 8
+        settingsStack.addArrangedSubview(carbitBox)
         contentStack = stack
         orientationControl.selectedSegmentIndex = UserDefaults.standard.bool(forKey: "portraitDisplay") ? 1 : 0
         orientationControl.addTarget(self, action: #selector(orientationChanged), for: .valueChanged)
@@ -195,9 +214,20 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             stack.widthAnchor.constraint(lessThanOrEqualToConstant: 720)
         ])
         receiver.onLog = { [weak self] in self?.log($0) }; bluetooth.onLog = { [weak self] in self?.log($0) }
+        carbitLink.onLog = { [weak self] in self?.log($0) }
+        carbitLink.onStateChange = { [weak self] connected in
+            self?.log(connected ? "亿连仪表已连接" : "亿连仪表已断开")
+        }
+        carbitLink.onCaptureConfig = { [weak self] config in
+            self?.log("亿连要求 \(config.width)×\(config.height) @ \(config.bitRate)bps")
+        }
+        carbitLink.onTouch = { [weak self] x, y, down in
+            self?.receiver.touch(x: x, y: y, down: down)
+        }
         receiver.onControlConnected = { [weak self] in self?.sameDevice.didConnectControl() }
         receiver.onVideo = { [weak self] data in
             guard let self, self.running else { return }
+            self.carbitLink.submit(accessUnit: data)
             do {
                 try self.videoSurface.enqueue(accessUnit: data)
                 self.videoSurface.isHidden = false
@@ -489,6 +519,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
                 self.sameDevice.start(configuration: live, identity: identity)
             }
             receiver.start(configuration: config, identity: identity)
+            startCarbitLinkIfEnabled()
             return
         }
         guard let identity else { return }
@@ -513,10 +544,27 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         }
         receiver.start(configuration: config, identity: identity)
     }
+    /// 按界面开关启动亿连输出。不改动原有任何输出路径，只多开一路。
+    private func startCarbitLinkIfEnabled() {
+        UserDefaults.standard.set(carbitLinkSwitch.isOn, forKey: "carbitLinkEnabled")
+        let host = (carbitHostField.text ?? "").trimmingCharacters(in: .whitespaces)
+        UserDefaults.standard.set(host, forKey: "carbitLinkHost")
+        guard carbitLinkSwitch.isOn else { return }
+        guard !host.isEmpty else {
+            log("亿连输出已开启，但没填仪表 IP。先连上仪表热点，把网关地址（如 192.168.49.1）填进设置。")
+            return
+        }
+        var configuration = CarbitLinkOutput.Configuration()
+        configuration.host = host
+        carbitLink.start(configuration: configuration)
+        log("亿连输出已启动，目标 \(host)")
+    }
+
     private func stop() {
         hideFullscreen(); fullscreenButton.isHidden = true
         displayedVideo = false; videoSurface.reset(); videoSurface.isHidden = true
         running = false; receiver.onListening = nil; bluetooth.stop(); sameDevice.stop(); controlBrowser.stop(); receiver.stop()
+        carbitLink.stop()
         receiverBrowser.stop()
         modeControl.isEnabled = true
         UIApplication.shared.isIdleTimerDisabled = false; setEditing(true)
