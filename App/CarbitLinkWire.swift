@@ -1,51 +1,63 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // CarbitLinkWire.swift
-// 亿连（CarbitLink）线上格式 —— v0.9，按 APK 静态逆向 + 原厂 logcat 重建握手层。
+// 亿连（CarbitLink）线上格式 —— v1.0，第一帧命令码定案（PLT→GOT→符号铁证）。
 //
-// 【v0.9 决定性纠错 —— dump(5) 实车 + libEPSDK.so 反汇编 + 原厂 logcat 三方印证】
-//   1. 车机回的 0x70000011 {"status":false} 【不是 handleClientInfo 的任何失败分支】：
-//      · C2PMainService::handleClientInfo（@0x1bebec）失败只回 0x80000030，
-//        成功回 0x00010011；函数体内【没有】"status" 字符串，也【没有】0x70000011 常量，
-//        更【没有】调用 checkPermission / checkClientPXCAuth（bl 目标表已核）。
-//      · libEPSDK.so 里 "status" 只被 4 个 handler 引用，应答码分别是
-//        0x00010411 / 0x00010431 / 0x00010751 …，全都不是 0x70000011。
-//      · 0x70000011 = C2P 服务基址 0x70000000 + 通用状态操作码 0x0011
-//        （0x3addd 起是 0x??000011 一族码表）。
-//      → 拒绝发生在【PXC 会话准入层】，CLIENT_INFO 载荷根本没被解析。
-//        这解释了 v0.1~v0.8 六种完全不同的载荷都收到字节级相同的同一帧。
-//   2. 准入层 EPSDKContext::checkClientPXCAuth(channel, uuid) 查本地
-//      pxc_auth_file 里的 channel&&uuid 记录（readClientPXCAuthFile 解析 JSON 数组，
-//      键为 "channel" / "uuid"）。授权的是【原厂 App 的 (channel, phoneUUID) 组合】。
-//   3. 原厂身份已由用户此前抓的 logcat（AppCommonInfoPrinter）静态给出，无需再测：
-//        Link(channel) = 44001          ← v0.8 误改成 9975，是致命回归
-//        LinkFlavor    = 50
-//        phoneUUID     = 45f68d78-cd77-4c1a-a8cd-080249272b48   ← 带连字符 36 字符
-//        phoneBrand=Xiaomi  phoneModel=2206122SC  phoneOs=Android  phoneOsVersion=35
-//        package=net.easyconn.carman.easyride  versionCode=37  sdkVersion=5.1.1
-//        speechEngineType=2
-//      v0.8 用的随机 32 位无连字符 UUID + channel 9975 永远命中不了授权记录。
-//   4. 车机【从不主动发首帧】（dump(5) 两次会话 3 秒静默实证），
-//      v0.8「先静默等车机 CLIENT_INFO」的假设被证伪；v0.9 连上 10930 立即上报。
+// 【v1.0 决定性纠错 —— dump(6) + libEPSDK.so PLT/GOT 全链解析】
+//   v0.1~v0.9 九个版本都把 CLIENT_INFO 载荷装在 0x000103F0 里发出去。
+//   C2PMainService::handleCMD(@0x1be944) 的 case 分支经 PLT 桩 → GOT 重定位
+//   → .dynsym 解析后，真实映射是：
+//       0x00010010 → PLT 0x3706e0 → GOT 0x3b21b8 → handleClientInfo  ★
+//       0x000103F0 → PLT 0x3706d0 → GOT 0x3b21b0 → handleOpenPage    ✗
+//   即 0x000103F0 是「打开页面」，不是 CLIENT_INFO。车机按 openPage 处理，
+//   收到一整包身份 JSON 参数对不上，直接回通用拒绝 0x70000011
+//   {"status":false} 并 RST —— 载荷从未被 handleClientInfo 解析过一次。
+//   这解释了为什么 378B / 1060B / 1070B 三种载荷、Apple / Xiaomi 两种身份、
+//   channel 9975 / 44001、有无 RSA，回车全是字节级相同的同一帧。
 //
-// 【证据链（2026-11-21，easyride APK 内 libEPSDK.so；两端 MD5 完全相同）】
-//   · PXCService::sendCMD / recvCMD / checkCMD（@0x1bdcd0 / 0x1be044 / 0x1bdc84）：
-//     控制通道（10930）的帧头固定 16 字节 ——
+//   handleClientInfo(@0x1bebec) 解析的键正是我们构造的字段：
+//     sdkVersion / flavor / channel / productType / supportMic / …，
+//   成功回 0x00010011（= 0x10010 + 1；函数内 0x1beee4 构造），
+//   失败（JSON 格式错 / flavor|channel 缺失 / checkPermission 不过）回 0x80000030，
+//   日志前缀 `[P2CService]handleClientInfo: flavor or channel is not exist`。
+//   → 手机第一帧必须是 0x00010010，既不是 0x000103F0，也不是「等车机先发」。
+//
+// 【完整 case 表（PLT→GOT→符号，静态实锤，推翻 v0.9 旧表）】
+//   0x00010010 handleClientInfo         0x00010020 handleEnableDownloadPhoneAudio
+//   0x00010060 handleMicRecordData      0x00010200 handleNightMode
+//   0x00010350 handleBtnEvent           0x000103B0 handleCheckCarUUID (→0x103B1)
+//   0x000103E0 handleCheckSN (→0x103E1)
+//   0x000103F0 handleOpenPage           ← 前 9 版误用
+//   0x00010410 handleCheckNetwork      0x00010430 handleQueryGPS
+//   0x00010450 handleQueryTime         0x00010750 handleCheckAppNetworkCapability
+//   0x00010780 handleRunningLog
+//
+// 【0x70000011 的真身】C2PService::handleCMD(@0x1c1b08) 只处理心跳 0x70000001；
+//   handleUnSupport(@0x1c1cd0) 无 status 串；全 so 里 "status" 的 4 处 xref 落在
+//   handleCheckNetwork / handleQueryGPS / handleCheckAppNetworkCapability /
+//   notifyPageStatusChanged，均不生成 0x70000011。0x3addd 起是
+//   0x??000011 一族「服务号 + 通用操作码 0x0011」的码表。
+//   → 该帧出自【仪表固件】，不在手机 APK 内，是非法命令/会话准入的通用拒绝。
+//
+// 【v0.9 保留的正确部分】原厂身份（channel=44001、带连字符 phoneUUID、
+//   Xiaomi/2206122SC/Android/35、versionCode=37）、连上立即发的时序、
+//   RSA-1024 SPKI pubkey + encryptedHUID —— 全部保留，只换命令码。
+//
+// 【帧格式（静态 + 实车双重确认，两端 libEPSDK.so MD5 完全相同）】
+//   · PXC 控制通道 10930：16 字节头
 //       [0..3]  cmd   u32 LE   指令码（高 16 位服务号，低 16 位操作码）
 //       [4..7]  total u32 LE   = 16 + 载荷长度
 //       [8..11] cmd ^ total    校验字
 //       [12..15] version u32   版本（回复时原样带回）
-//     实车验证：仪表回复 `11 00 00 70 | 24 00 00 00 | 35 00 00 70 | 00 00 00 00`
-//     = cmd 0x70000011 / total 36 / 校验 0x70000035，且 0x70000011^0x24=0x70000035 ✓
+//     实车：仪表回 `11 00 00 70 | 24 00 00 00 | 35 00 00 70 | 00 00 00 00`
+//     = cmd 0x70000011 / total 36 / 校验 0x70000035，0x70000011^0x24=0x70000035 ✓
 //   · MirrorService::sendCMD（@0x1d5a38）：镜像通道帧头 8 字节 ——
 //       [0..1] code u16 LE   [2..3] len u16 LE   [4..7] param u32 LE
-//   · C2PMainService::handleCMD（@0x1be944）的 PLT 桩分发表：
-//       0x00010010 → handleNightMode（夜间模式，❌ 旧表误标「开始镜像」）
-//       0x00010020 → handleBtnEvent   0x000103B0 → handleCheckCarUUID（回 ...3B1）
-//       0x000103E0 → handleCheckSN    0x000103F0 → handleClientInfo ★
 //
-// 【仍未确认 —— dump 里会直接看到】
-//   · 车机 pxc_auth_file 里是否已有 (44001, 45f68d78-…) 这条授权记录。
+// 【v1.0 判据（装包后 dump 一眼可判，不再迭代）】
+//   · 出现 0x00010011 = handleClientInfo 成功，握手推进 ✅
+//   · 出现 0x80000030 = 载荷已被解析但 checkPermission 不过 → 字段问题，静态可再查
+//   · 仍是 0x70000011 {"status":false} = 仪表固件层拒绝，纯侧载无法自证 → 收敛路线 A
 //   · 手机推帧的镜像码：暂定 0x0071（TODO probe）；心跳应答码：先原样回显。
 //
 
@@ -73,24 +85,35 @@ final class CarbitLinkWire {
 
     /// PXC 控制通道指令（32 位）。低 16 位是操作码，高 16 位是服务号。
     enum PXC {
-        /// 车机 → 手机：CLIENT_INFO 能力通告（ECP_C2P_CLIENT_INFO.a()）。
+        /// 【v1.0 核心修正】手机 → 车机：CLIENT_INFO。
+        /// C2PMainService::handleCMD case 0x00010010 → PLT 0x3706e0
+        /// → GOT 0x3b21b8 → C2PMainService::handleClientInfo。
+        /// 前 9 版误用 0x000103F0（handleOpenPage），载荷从未被解析。
+        static let clientInfo: UInt32 = 0x00010010
+
+        /// 车机 → 手机：handleClientInfo 成功应答（请求码 +1，0x1beee4 构造）。
+        static let clientInfoAck: UInt32 = 0x00010011
+        /// 车机 → 手机：handleClientInfo 失败应答（JSON 格式错 /
+        /// flavor|channel 缺失 / checkPermission 不过），0x1bef0c 构造 0x80000030。
+        static let clientInfoNack: UInt32 = 0x80000030
+
+        /// 兼容 v0.8 被动路径命名（车机下发 CLIENT_INFO 请求 / 手机应答）。
         static let carClientInfoRequest: UInt32 = 0x00010010
-        /// 手机 → 车机：CLIENT_INFO 应答（u0 父类 e() 里 t.k(a()+1)）。
         static let carClientInfoReply: UInt32 = 0x00010011
-        /// 手机 → 仪表：native handleClientInfo(@0x1bebec) 的解析侧 CLIENT_INFO 码。
-        /// v0.9 连上 10930 后立即用它上报身份。
-        static let clientInfo: UInt32 = 0x000103F0
+
         /// 校验回复码规律：请求 +1。
         static let checkCarUUID: UInt32 = 0x000103B0
         static let checkCarUUIDReply: UInt32 = 0x000103B1
         static let checkSN: UInt32 = 0x000103E0
-        /// 0x00010010 实为 handleNightMode；0x00010020 为 handleBtnEvent。
-        static let nightMode: UInt32 = 0x00010010
-        static let btnEvent: UInt32 = 0x00010020
+        /// 【v1.0 留档】0x000103F0 = handleOpenPage，前 9 版误用它发身份包。
+        static let openPage: UInt32 = 0x000103F0
+        /// v1.0 修正后的 case 表常量（旧表把 0x10010 标成 nightMode 是错的）。
+        static let nightMode: UInt32 = 0x00010200
+        static let btnEvent: UInt32 = 0x00010350
         /// 手机 → 仪表：屏幕信息（P2C，P2CMainService::notifyAppStatusChanged）。
         static let screenInfo: UInt32 = 0x00020020
         static let requestStartMirror: UInt32 = 0x000201C0
-        /// 仪表 → 手机：PXC 准入层通用状态帧（实车 0x70000011，{\n\t"status":\tfalse\n}）。
+        /// 仪表 → 手机：准入层 / 非法命令通用拒绝（实车 0x70000011，{"status":false}）。
         static let clientInfoReply: UInt32 = 0x70000011
     }
 
@@ -259,8 +282,11 @@ final class CarbitLinkWire {
         return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
     }
 
-    /// 【v0.9】被动应答 `0x00010011`：严格按 ECP_C2P_CLIENT_INFO.u0(Map) 构造。
-    /// `carHUID` 必须用【车机在 0x00010010 里下发的 HUID】——车机拿 pubkey 还原
+    /// 【v1.0 保留的被动路径】本车实测车机不主动发 CLIENT_INFO，且 0x00010011
+    /// 实为 handleClientInfo 的【车机→手机】成功应答，正常流程不会调用本函数
+    /// （Output 里 didSendProactiveInfo 已守卫）。若换仪表会主动下发，
+    /// 仍按 ECP_C2P_CLIENT_INFO.u0(Map) 构造。
+    /// `carHUID` 必须用【车机下发的 HUID】——车机拿 pubkey 还原
     /// encryptedHUID 后要和这个自己发的值比对，填错必被拒。
     static func clientInfoReplyJSON(
         identity: ClientIdentity, carHUID: String,
@@ -365,12 +391,12 @@ final class CarbitLinkWire {
     }
 
     /// 低 16 位操作码 → 事件。
-    /// 注意 0x0011 不是采集参数：实车验证它是通用状态帧（准入层 NACK），
-    /// 载荷是 JSON（{\n\t"status":\tfalse\n}），归入 unknown 让上层打文本。
+    /// 【v1.0】low16=0x0011 有两种：0x00010011 是 handleClientInfo 成功应答，
+    /// 0x70000011 是仪表固件的通用拒绝帧；都归入 unknown 让上层按 fullCode 判定。
     private static func classify(low16: UInt16, fullCode: UInt32, payload: Data, framing: Framing, version: UInt32) -> [Event] {
         switch low16 {
         case 0x0010:
-            // 0x00010010 是车机 CLIENT_INFO 请求，载荷是 JSON，
+            // 0x00010010 = handleClientInfo（手机上报 CLIENT_INFO），载荷是 JSON，
             // 绝不能先喂给 protobuf 解码器。
             if payload.first == UInt8(ascii: "{") {
                 return [.unknown(code: fullCode, payload: payload, framing: framing)]
@@ -379,7 +405,8 @@ final class CarbitLinkWire {
             if let cfg { return [.start(cfg)] }
             return [.start(nil)]
         case 0x0011:
-            // 0x70000011 = PXC 准入层通用状态帧（不是 handleClientInfo 的应答）。
+            // 0x00010011 = handleClientInfo 成功应答；
+            // 0x70000011 = 仪表固件通用拒绝（{"status":false}）。
             return [.unknown(code: fullCode, payload: payload, framing: framing)]
         case MirrorCode.ready.rawValue:
             return [.ready]
