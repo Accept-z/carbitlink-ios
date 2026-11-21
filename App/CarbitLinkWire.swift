@@ -1,30 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // CarbitLinkWire.swift
-// 亿连（CarbitLink）线上格式 —— 按 2026-11-21 真机实测重写。
+// 亿连（CarbitLink）线上格式 —— v0.4，按 libEPSDK.so 反汇编重写。
 //
-// 【实测来源】小米 12S Pro / 亿连骑行 v5.1.1 / HyperOS 3.0.4.0 / Android 15，
-// 仪表 IP 192.168.49.108，两次完整会话（17:39:24-17:40:38、17:41:04-17:42:05）。
-// 证据链：手机端 logcat（亿连进程 pid 9586）+ 每 2 秒一次的 /proc/net/tcp 快照。
+// 【证据链（2026-11-21，easyride APK 内 libEPSDK.so，与车机端同一二进制）】
+//   · PXCService::sendCMD / recvCMD / checkCMD（@0x1bdcd0 / 0x1be044 / 0x1bdc84）：
+//     控制通道（10930）的帧头固定 16 字节 ——
+//       [0..3]  cmd   u32 LE   指令码（高 16 位服务号，低 16 位操作码）
+//       [4..7]  total u32 LE   = 16 + 载荷长度
+//       [8..11] cmd ^ total    校验字
+//       [12..15] version u32   版本（回复时原样带回）
+//     实车验证：仪表回复 `11 00 00 70 | 24 00 00 00 | 35 00 00 70 | 00 00 00 00`
+//     = cmd 0x70000011 / total 36 / 校验 0x70000035，且 0x70000011^0x24=0x70000035 ✓
+//   · MirrorService::sendCMD（@0x1d5a38）：镜像通道帧头 8 字节 ——
+//       [0..1] code u16 LE   [2..3] len u16 LE   [4..7] param u32 LE
+//     与 Android logcat `rec First 0 [72,00,00,00,00,00,00,00]` 完全吻合。
+//   · C2PMainService::handleCMD（@0x1be944）的 switch：仪表接受 19 个 0x0001xxxx 指令，
+//     其中 0x00010010（开始镜像）、0x000103B0（CheckCarUUID，回 0x000103B1）、
+//     0x000103E0（CheckSN）。PXCService::getCheckUUIDCmd=0x000103B0 交叉验证一致。
+//   · 仪表→手机的推送走 0x7000xxxx 服务号（实车收到过 0x70000011）。
 //
-// 【已确认】
-//   · 帧头固定 8 字节：偏移 0 = 指令码(uint16 LE)，偏移 2 = 载荷长度(uint16 LE)，
-//     偏移 4-7 实测恒为 0（保留位）。单帧载荷上限 10240（0x2800）。
-//     直接证据：日志原文 `rec First 0 [72,00,00,00,00,00,00,00]`。
-//   · 端口：手机侧监听 10920(视频) / 10921(控制) / 10922(PXC)；仪表侧广播 10930。
-//   · 采集参数由仪表下发（cmd 0x0010，204 字节），本车实测 1152x640 / 3Mbps / H.264 /
-//     wantFps=0（拉模式）。
-//   · 拉模式：仪表每帧发一次 0x0072（载荷长度 0），手机收到后推一帧。
-//   · 握手明文字段：{"HUID":"<仪表 MAC 十六进制大写>","HUName":"<型号串>"}，
-//     HUID 与 mDNS TXT 里的 huid 一致（例 5478C9665F12 = 54:78:C9:66:5F:12）。
+// 【仍未确认 —— dump 里会直接看到】
+//   · 手机推帧的镜像码：暂定 0x0071（TODO probe）。
+//   · 心跳应答码：先原样回显。
 //
-// 【仍未确认 —— 因此标 TODO(probe)】
-//   · 手机回帧的指令码与封装（响应 0x0072 时发什么）。本文件默认按 0x0071 + 8 字节头
-//     + 裸 Annex-B 发送，并允许在 Probe 中枚举候选指令码。
-//   · PXC 通道（10922）的帧格式：日志里是 32 位码（0x00010010），与镜像通道的
-//     16 位码不同，故单独实现，标 TODO(probe)。
-//   · 205 字节 MirrorStart 的各字段：protobuf 字段号已知（见 MirrorConfig），
-//     但值为运行时内容，由 decodeMirrorConfig 按线格式解析，不硬编码偏移。
 
 import Foundation
 
@@ -38,26 +37,41 @@ enum CarbitLinkWireError: Error, LocalizedError {
 
 final class CarbitLinkWire {
 
-    // MARK: - 指令码（实测）
+    // MARK: - 通道与指令码
 
-    enum Code: UInt16 {
-        /// 仪表 → 手机：镜像启动，载荷 204 字节（含 MirrorConfig）
-        case start        = 0x0010
-        /// 仪表 → 手机：视频通道就绪（载荷长度 0）
-        case ready        = 0x0070
-        /// 仪表 → 手机：请求下一帧（拉模式，载荷长度 0）
-        case frameRequest = 0x0072
-        /// 双向：心跳
-        case heartbeat    = 0x0040
-        /// 手机 → 仪表：请求开始镜像（随后仪表连 10921 并发 start）
-        case requestStart = 0x01C0   // 完整码 0x000201C0，PXC 空间低 16 位
-        /// 手机 → 仪表：推帧。TODO(probe) 实测未捕获响应码，暂定为 0x0071。
-        case videoFrame   = 0x0071
+    /// 两条通道各自一套帧头。
+    enum Framing {
+        /// 控制通道（10930）：16 字节头。
+        case pxc
+        /// 镜像通道（10920/10921/10922）：8 字节头。
+        case mirror
     }
 
-    // MARK: - 采集参数（仪表下发）
+    /// PXC 控制通道指令（32 位）。低 16 位是操作码，高 16 位是服务号。
+    enum PXC {
+        /// 手机 → 仪表：请求开始镜像。
+        static let startMirror: UInt32 = 0x00010010
+        /// 手机 → 仪表：身份校验，负载为 JSON {"HUID":…,"HUName":…}。
+        static let checkCarUUID: UInt32 = 0x000103B0
+        /// 仪表 → 手机：身份校验回复。
+        static let checkCarUUIDReply: UInt32 = 0x000103B1
+        /// 手机 → 仪表：序列号校验。
+        static let checkSN: UInt32 = 0x000103E0
+        /// 屏幕触摸。
+        static let screenTouch: UInt32 = 0x00010020
+    }
 
-    /// 本车实测值：1152x640 / 3145728 / H.264 / pull。
+    /// 镜像通道指令（16 位）。
+    enum MirrorCode: UInt16 {
+        case start        = 0x0010   // 启动/采集参数（低 16 位，PXC 里 0x11 也是它的回复形态）
+        case ready        = 0x0070
+        case frameRequest = 0x0072
+        case heartbeat    = 0x0040
+        case videoFrame   = 0x0071   // TODO(probe)：手机推帧码，暂定
+    }
+
+    // MARK: - 采集参数
+
     struct CaptureConfig: Equatable {
         var width: Int = 1152
         var height: Int = 640
@@ -75,42 +89,60 @@ final class CarbitLinkWire {
         case start(CaptureConfig?)
         case ready
         case frameRequest
-        case heartbeat
-        case unknown(code: UInt16, payload: Data)
+        case heartbeat(code: UInt32, framing: Framing)
+        case unknown(code: UInt32, payload: Data, framing: Framing)
     }
 
     // MARK: - 常量
 
-    /// 单帧载荷上限，来自 `MirrorService::onRecv` 反汇编（0x2800）。
+    static let pxcHeaderSize = 16
+    static let mirrorHeaderSize = 8
+    /// 镜像通道单帧载荷上限（MirrorService::sendCMD 里缓冲 0x2800）。
     static let maxPayload = 10240
-    static let headerSize = 8
 
     // MARK: - 状态
 
+    private let framing: Framing
     private var buffer = Data()
     private(set) var config = CaptureConfig()
 
+    init(framing: Framing = .mirror) {
+        self.framing = framing
+    }
+
     // MARK: - 组包（发送）
 
-    /// 8 字节头 + 载荷。长度超上限直接抛错，避免发出仪表无法解析的帧。
-    func frame(code: Code, payload: Data = Data()) throws -> Data {
-        guard payload.count <= Self.maxPayload else {
-            throw CarbitLinkWireError.malformed("载荷 \(payload.count) 超过上限 \(Self.maxPayload)")
-        }
-        var out = Data(capacity: Self.headerSize + payload.count)
-        out.appendLE16(code.rawValue)
-        out.appendLE16(UInt16(payload.count))
-        out.append(contentsOf: [0, 0, 0, 0])   // 偏移 4-7 实测恒 0
+    /// PXC 帧：16 字节头 + 载荷。
+    static func pxcFrame(cmd: UInt32, payload: Data = Data(), version: UInt32 = 0) throws -> Data {
+        let total = UInt32(pxcHeaderSize + payload.count)
+        var out = Data(capacity: Int(total))
+        out.appendLE32(cmd)
+        out.appendLE32(total)
+        out.appendLE32(cmd ^ total)
+        out.appendLE32(version)
         out.append(payload)
         return out
     }
 
-    /// 推一帧 H.264（Annex-B）。TODO(probe) 响应码与是否需要时间戳前缀待实测。
-    func videoFrame(annexB: Data) throws -> Data {
-        try frame(code: .videoFrame, payload: annexB)
+    /// 镜像帧：8 字节头 + 载荷。
+    static func mirrorFrame(code: UInt16, param: UInt32 = 0, payload: Data = Data()) throws -> Data {
+        guard payload.count <= maxPayload else {
+            throw CarbitLinkWireError.malformed("载荷 \(payload.count) 超过镜像帧上限 \(maxPayload)")
+        }
+        var out = Data(capacity: mirrorHeaderSize + payload.count)
+        out.appendLE16(code)
+        out.appendLE16(UInt16(payload.count))
+        out.appendLE32(param)
+        out.append(payload)
+        return out
     }
 
-    /// 握手 JSON（明文）。HUID 用仪表 MAC 的十六进制大写形式。
+    /// 推一帧 H.264（Annex-B）。TODO(probe) 响应码与 param 含义待实测。
+    func videoFrame(annexB: Data) throws -> Data {
+        try Self.mirrorFrame(code: MirrorCode.videoFrame.rawValue, payload: annexB)
+    }
+
+    /// 握手 JSON（CheckCarUUID 的负载）。HUID 用仪表 MAC 的十六进制大写形式。
     static func handshakeJSON(huid: String, huName: String) -> Data {
         let object: [String: Any] = ["HUID": huid, "HUName": huName]
         return (try? JSONSerialization.data(withJSONObject: object, options: [])) ?? Data()
@@ -118,52 +150,76 @@ final class CarbitLinkWire {
 
     // MARK: - 拆包（接收）
 
-    /// 把到达的字节流切成事件。按「8 字节头 + uint16 长度」定长解析，不做启发式猜测。
     func consume(_ data: Data) -> [Event] {
         buffer.append(data)
+        switch framing {
+        case .pxc: return consumePXC()
+        case .mirror: return consumeMirror()
+        }
+    }
+
+    private func consumePXC() -> [Event] {
         var events: [Event] = []
-        while buffer.count >= Self.headerSize {
+        while buffer.count >= Self.pxcHeaderSize {
+            let cmd = buffer.le32(at: 0)
+            let total = buffer.le32(at: 4)
+            let checksum = buffer.le32(at: 8)
+            let version = buffer.le32(at: 12)
+            // 帧头自校验：cmd ^ total 必须等于校验字；total 至少等于头长。
+            if total < UInt32(Self.pxcHeaderSize) || total > 0x40000 || (cmd ^ total) != checksum {
+                let raw = buffer.prefix(Self.pxcHeaderSize)
+                events.append(.unknown(code: cmd, payload: Data(raw), framing: .pxc))
+                buffer.removeFirst(Self.pxcHeaderSize)
+                continue
+            }
+            guard buffer.count >= Int(total) else { break }
+            let payload = buffer.subdata(in: Self.pxcHeaderSize ..< Int(total))
+            buffer.removeFirst(Int(total))
+            events.append(contentsOf: Self.classify(low16: UInt16(cmd & 0xFFFF), fullCode: cmd, payload: payload, framing: .pxc, version: version))
+        }
+        return events
+    }
+
+    private func consumeMirror() -> [Event] {
+        var events: [Event] = []
+        while buffer.count >= Self.mirrorHeaderSize {
             let code = buffer.le16(at: 0)
             let length = Int(buffer.le16(at: 2))
             guard length <= Self.maxPayload else {
-                // 长度非法说明字节流已错位，或对端帧头布局与我方假设不同。
-                // 早先这里直接丢弃、什么都不留，实车上表现为「连上了但毫无反应」。
-                // 现在把 8 字节原始头部当未知指令抛出去，至少能在日志/dump 里看到。
-                let raw = buffer.prefix(Self.headerSize)
-                events.append(.unknown(code: code, payload: Data(raw)))
-                buffer.removeFirst(Self.headerSize)
+                let raw = buffer.prefix(Self.mirrorHeaderSize)
+                events.append(.unknown(code: UInt32(code), payload: Data(raw), framing: .mirror))
+                buffer.removeFirst(Self.mirrorHeaderSize)
                 continue
             }
-            guard buffer.count >= Self.headerSize + length else { break }
-            let payload = buffer.subdata(in: Self.headerSize ..< Self.headerSize + length)
-            buffer.removeFirst(Self.headerSize + length)
-
-            switch Code(rawValue: code) {
-            case .start:
-                let cfg = Self.decodeMirrorConfig(payload)
-                if let cfg { config = cfg }
-                events.append(.start(cfg))
-            case .ready:
-                events.append(.ready)
-            case .frameRequest:
-                events.append(.frameRequest)
-            case .heartbeat:
-                events.append(.heartbeat)
-            case .videoFrame, .requestStart:
-                // 这两个是「我方发出」的码，正常不会从对端收到；真收到就按未知处理并转储。
-                events.append(.unknown(code: code, payload: payload))
-            case nil:
-                events.append(.unknown(code: code, payload: payload))
-            }
+            guard buffer.count >= Self.mirrorHeaderSize + length else { break }
+            let payload = buffer.subdata(in: Self.mirrorHeaderSize ..< Self.mirrorHeaderSize + length)
+            buffer.removeFirst(Self.mirrorHeaderSize + length)
+            events.append(contentsOf: Self.classify(low16: code, fullCode: UInt32(code), payload: payload, framing: .mirror, version: 0))
         }
         return events
+    }
+
+    /// 低 16 位操作码 → 事件。0x0010/0x0011 都按「采集参数」处理：
+    /// 0x11 是 0x10 的回复形态（对照 0x3B0 → 0x3B1 的加一规律）。
+    private static func classify(low16: UInt16, fullCode: UInt32, payload: Data, framing: Framing, version: UInt32) -> [Event] {
+        switch low16 {
+        case 0x0010, 0x0011:
+            return [.start(decodeMirrorConfig(payload))]
+        case MirrorCode.ready.rawValue:
+            return [.ready]
+        case MirrorCode.frameRequest.rawValue:
+            return [.frameRequest]
+        case MirrorCode.heartbeat.rawValue:
+            return [.heartbeat(code: fullCode, framing: framing)]
+        default:
+            return [.unknown(code: fullCode, payload: payload, framing: framing)]
+        }
     }
 
     // MARK: - MirrorConfig（protobuf 线格式）
 
     /// 字段号来自车机端 dex 常量 `ECTinyPlus$MirrorConfig`：
     /// 1 宽 2 高 3 WANTFPS 4 编码器 5 画质 6 码率 7 物理宽 8 物理高 9 DPI。
-    /// 按变长整数逐字段解析，不假设偏移，字段缺失保持默认值。
     static func decodeMirrorConfig(_ data: Data) -> CaptureConfig? {
         var cfg = CaptureConfig()
         var hit = false
@@ -174,7 +230,7 @@ final class CarbitLinkWire {
             index = next
             let field = Int(key >> 3)
             let wireType = Int(key & 0x7)
-            if wireType != 0 {                 // 只关心 varint 字段，其余跳过
+            if wireType != 0 {
                 guard let skipped = skipField(bytes, index, wireType: wireType) else { break }
                 index = skipped
                 continue
@@ -195,6 +251,36 @@ final class CarbitLinkWire {
             }
         }
         return hit ? cfg : nil
+    }
+
+    /// 请求开始镜像时上报我方期望的采集参数（protobuf，字段号同上）。
+    static func encodeMirrorConfig(_ cfg: CaptureConfig) -> Data {
+        var out = Data()
+        appendField(1, UInt64(max(1, cfg.width)), to: &out)
+        appendField(2, UInt64(max(1, cfg.height)), to: &out)
+        appendField(3, UInt64(cfg.wantFps), to: &out)
+        appendField(4, UInt64(cfg.encoder), to: &out)
+        appendField(5, UInt64(cfg.quality), to: &out)
+        appendField(6, UInt64(cfg.bitRate), to: &out)
+        if cfg.physicalWidth > 0 { appendField(7, UInt64(cfg.physicalWidth), to: &out) }
+        if cfg.physicalHeight > 0 { appendField(8, UInt64(cfg.physicalHeight), to: &out) }
+        if cfg.dpi > 0 { appendField(9, UInt64(cfg.dpi), to: &out) }
+        return out
+    }
+
+    private static func appendVarint(_ value: UInt64, to data: inout Data) {
+        var v = value
+        repeat {
+            var byte = UInt8(v & 0x7F)
+            v >>= 7
+            if v != 0 { byte |= 0x80 }
+            data.append(byte)
+        } while v != 0
+    }
+
+    private static func appendField(_ number: Int, _ value: UInt64, to data: inout Data) {
+        appendVarint(UInt64(number) << 3, to: &data)   // wire type 0
+        appendVarint(value, to: &data)
     }
 
     private static func readVarint(_ bytes: [UInt8], _ start: Int) -> (UInt64, Int)? {
@@ -226,14 +312,6 @@ final class CarbitLinkWire {
     // MARK: - mDNS TXT
 
     /// 解析 `_EasyConn._tcp` 的 TXT 记录。实测键：huid / port / flavor / packagename / channel。
-    struct ServiceInfo {
-        var host: String
-        var port: UInt16
-        var huid: String
-        var flavor: Int
-        var channel: Int
-    }
-
     static func parseTXT(_ records: [String: String]) -> (huid: String, port: UInt16, flavor: Int, channel: Int) {
         let huid = records["huid"] ?? ""
         let port = UInt16(records["port"] ?? "") ?? 0
@@ -263,13 +341,24 @@ extension Data {
         append(contentsOf: [UInt8(value & 0xFF), UInt8(value >> 8 & 0xFF)])
     }
 
+    mutating func appendLE32(_ value: UInt32) {
+        append(contentsOf: [UInt8(value & 0xFF), UInt8(value >> 8 & 0xFF),
+                            UInt8(value >> 16 & 0xFF), UInt8(value >> 24 & 0xFF)])
+    }
+
     func le16(at offset: Int) -> UInt16 {
         guard offset + 1 < count else { return 0 }
         let bytes = [UInt8](self[offset ... offset + 1])
         return UInt16(bytes[0]) | (UInt16(bytes[1]) << 8)
     }
 
-    /// 十六进制转储，用于 probe 模式记录线上原始字节。
+    func le32(at offset: Int) -> UInt32 {
+        guard offset + 3 < count else { return 0 }
+        let bytes = [UInt8](self[offset ... offset + 3])
+        return UInt32(bytes[0]) | (UInt32(bytes[1]) << 8) | (UInt32(bytes[2]) << 16) | (UInt32(bytes[3]) << 24)
+    }
+
+    /// 十六进制转储，用于记录线上原始字节。
     func hexDump(limit: Int = 512) -> String {
         let slice = prefix(limit)
         let hex = slice.map { String(format: "%02X", $0) }.joined(separator: " ")
