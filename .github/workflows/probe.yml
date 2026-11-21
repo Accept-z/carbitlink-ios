@@ -1,12 +1,8 @@
-
 name: probe
-on: workflow_dispatch:
-jobs:
-  linux:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "linux ok"; uname -a
-  mac:
-    runs-on: macos-14
-    steps:
-      - run: echo "mac ok"; xcodebuild -version
+
+on:/n  workflow_dispatch:/n/njobs:/n  linux:/n    runs-on: ubuntu-latest
+    steps:/n      - name: hello
+        run: echo linux-ok && uname -a
+  mac:/n    runs-on: macos-14
+    steps:/n      - name: hello
+        run: echo mac-ok && xcodebuild -version
