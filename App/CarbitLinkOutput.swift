@@ -406,6 +406,46 @@ final class CarbitLinkOutput {
         return "\(parts[0]).\(parts[1]).\(parts[2]).1"
     }
 
+    /// 直接往 dump 追加一行（诊断用，不依赖是否正在采集）。
+    static func appendDumpLine(_ line: String) {
+        guard let url = dumpURL else { return }
+        if !FileManager.default.fileExists(atPath: url.path) { ensureDumpFile() }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        handle.seekToEndOfFile()
+        if let data = (line + "\n").data(using: .utf8) { try? handle.write(contentsOf: data) }
+        try? handle.close()
+    }
+
+    /// 探测某个 host:port 是否有 TCP 服务在听。
+    /// 语义上只判断「能建连」：.ready = 通，.failed / .waiting（含 ECONNREFUSED、不可达）= 不通。
+    static func probe(host: String, port: UInt16, timeout: TimeInterval = 0.9) -> Bool {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return false }
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        let semaphore = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var settled = false
+        var reachable = false
+        func settle(_ value: Bool) {
+            lock.lock()
+            if settled { lock.unlock(); return }
+            settled = true
+            reachable = value
+            lock.unlock()
+            semaphore.signal()
+        }
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready: settle(true)
+            case .failed, .waiting: settle(false)
+            default: break
+            }
+        }
+        connection.start(queue: DispatchQueue.global(qos: .utility))
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut { settle(false) }
+        connection.cancel()
+        return reachable
+    }
+
     private func dump(_ data: Data, tag: String) {
         write("\(tag) \(data.count)B | \(data.hexDump())")
     }
