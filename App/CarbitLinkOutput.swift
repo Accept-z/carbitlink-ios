@@ -74,18 +74,26 @@ final class CarbitLinkOutput {
     private var pendingFrame: Data?
     private var frameInFlight = false
     private var dumpHandle: FileHandle?
+    /// 上一次上报给 UI 的连接状态。只在真实跃变时回调，
+    /// 避免 stop() 每次都报一次"已断开"（日志里会和 Receiver stopped 成对出现，纯噪声）。
+    private var reportedConnected = false
 
     // MARK: - 对外
 
     func start(configuration: Configuration) {
         stop()
         config = configuration
+        // dump 先开，哪怕 host 是空的也留一条记录，免得用户以为功能没跑。
+        openDumpIfNeeded()
         guard !config.host.isEmpty else {
             log("未填仪表 IP。请先连上仪表热点，再填网关地址（一般 192.168.49.1）。")
+            if let gw = Self.suggestedGateway() {
+                log("按本机地址推断，网关应该是 \(gw)，可直接填进设置。")
+            }
+            stop()
             return
         }
         isRunning = true
-        openDumpIfNeeded()
         log("开始连接仪表 \(config.host)，控制端口候选 \(portList(config.controlPorts))")
         connectControlResetting()
     }
@@ -101,11 +109,12 @@ final class CarbitLinkOutput {
         pendingFrame = nil
         frameInFlight = false
         if dumpHandle != nil {
+            write("=== 会话结束 \(ISO8601DateFormatter().string(from: Date())) ===")
             log("dump 已写入 Documents/carbitlink-dump.log")
             try? dumpHandle?.close()
             dumpHandle = nil
         }
-        onStateChange?(false)
+        setConnected(false)
     }
 
     /// 由 ReceiverViewController 的 onVideo 调用：送一帧 Annex-B。
@@ -144,7 +153,7 @@ final class CarbitLinkOutput {
             case .ready:
                 self.controlReady = true
                 self.log("控制通道已连上 \(self.config.host):\(port) ★")
-                self.onStateChange?(true)
+                self.setConnected(true)
                 self.beginControlSession()
             case .failed(let error):
                 self.log("控制通道 \(port) 失败：\(error.localizedDescription)")
@@ -339,19 +348,62 @@ final class CarbitLinkOutput {
 
     // MARK: - 转储
 
-    private var dumpURL: URL? {
+    /// dump 文件固定落在 Documents 根目录，便于「文件」App 直接看到。
+    static var dumpURL: URL? {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
             .appendingPathComponent("carbitlink-dump.log")
     }
 
-    private func openDumpIfNeeded() {
-        guard config.dumpsBytes, let url = dumpURL else { return }
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
+    /// App 一启动就把文件建出来（带表头）。
+    /// 否则用户可能在"从没连上过"的情况下根本找不到这个文件，
+    /// 误以为是功能没生效。
+    @discardableResult
+    static func ensureDumpFile() -> URL? {
+        guard let url = dumpURL else { return nil }
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: url.path) {
+            fm.createFile(atPath: url.path, contents: nil)
         }
+        let attributes = try? fm.attributesOfItem(atPath: url.path)
+        let existingSize = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        if existingSize > 0 { return url }
+        let header = """
+        === CarbitLink dump ===
+        文件：Documents/carbitlink-dump.log
+        说明：亿连输出启动后，这里记录每条 TCP 的收发字节（ctl/data/ctl-tx/data-tx）
+              以及文字日志（以 # 开头）。没连上仪表时也会留下尝试记录。
+        创建：\(ISO8601DateFormatter().string(from: Date()))
+
+        """
+        try? header.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    private func openDumpIfNeeded() {
+        guard config.dumpsBytes, let url = Self.ensureDumpFile() else { return }
         dumpHandle = try? FileHandle(forWritingTo: url)
         dumpHandle?.seekToEndOfFile()
-        write("=== \(ISO8601DateFormatter().string(from: Date())) 新会话 host=\(config.host) ===")
+        let ip = Self.localWiFiAddress() ?? "未知"
+        write("")
+        write("=== 新会话 \(ISO8601DateFormatter().string(from: Date())) ===")
+        write("# 目标 host=\(config.host)")
+        write("# 控制端口候选=\(portList(config.controlPorts)) 视频端口候选=\(portList(config.dataPorts))")
+        write("# 本机 Wi-Fi 地址=\(ip)")
+        write("# 采集参数=\(config.width)x\(config.height) @\(config.bitRate)bps huid=\(config.huid.isEmpty ? "-" : config.huid)")
+    }
+
+    /// 当前 Wi-Fi 口地址，写进 dump 方便判断"手机到底在哪个网段"。
+    static func localWiFiAddress() -> String? {
+        ReceiverConfiguration.localIPv4Addresses().first
+    }
+
+    /// 由本机 Wi-Fi 地址推断仪表网关：192.168.49.2 → 192.168.49.1。
+    /// 亿连的车机热点通常就是这个网段的 .1，省得用户手填错。
+    static func suggestedGateway() -> String? {
+        guard let ip = localWiFiAddress() else { return nil }
+        let parts = ip.split(separator: ".")
+        guard parts.count == 4 else { return nil }
+        return "\(parts[0]).\(parts[1]).\(parts[2]).1"
     }
 
     private func dump(_ data: Data, tag: String) {
@@ -363,7 +415,16 @@ final class CarbitLinkOutput {
         try? handle.write(contentsOf: encoded)
     }
 
+    /// 状态只在真实跃变时上报，避免 stop() 制造假的"已断开"。
+    private func setConnected(_ connected: Bool) {
+        guard connected != reportedConnected else { return }
+        reportedConnected = connected
+        onStateChange?(connected)
+    }
+
     private func log(_ message: String) {
+        // 文字日志同时进 dump：即使仪表一个字节都没回，也能看出卡在哪一步。
+        write("# \(message)")
         onLog?("[亿连] " + message)
     }
 }
