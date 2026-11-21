@@ -199,11 +199,12 @@ final class CarbitLinkWire {
         return events
     }
 
-    /// 低 16 位操作码 → 事件。0x0010/0x0011 都按「采集参数」处理：
-    /// 0x11 是 0x10 的回复形态（对照 0x3B0 → 0x3B1 的加一规律）。
+    /// 低 16 位操作码 → 事件。
+    /// 注意 0x0011 不是采集参数：实车验证它是 0x10 的「状态回复」形态，
+    /// 载荷是 JSON（v0.5 实测收到 {"status": false}），归入 unknown 让上层打文本。
     private static func classify(low16: UInt16, fullCode: UInt32, payload: Data, framing: Framing, version: UInt32) -> [Event] {
         switch low16 {
-        case 0x0010, 0x0011:
+        case 0x0010:
             return [.start(decodeMirrorConfig(payload))]
         case MirrorCode.ready.rawValue:
             return [.ready]
