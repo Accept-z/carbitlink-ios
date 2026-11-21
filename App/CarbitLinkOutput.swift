@@ -1,26 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // CarbitLinkOutput.swift
-// 亿连（CarbitLink）仪表输出 —— v0.8，按 APK 静态逆向重建完整握手。
+// 亿连（CarbitLink）仪表输出 —— v0.9，按 APK 静态逆向 + 原厂 logcat 重建握手。
 //
 // 【拓扑（已由反汇编 + 实车双重确认）】
 //   · iPhone 连仪表热点 kt_ap_665F12（仪表即网关，实测 192.168.1.1）。
 //   · 控制通道：手机主动连 仪表:10930，PXC 16 字节帧头。
 //   · 镜像通道：iOS 端在 10920/10921/10922 上【监听】，等待仪表连入。
 //
-// 【v0.8 会话流程（推翻 v0.1~v0.7 的「手机抢先发第一帧」）】
-//   1. 连上 10930 → **先静默等待车机首帧（3 秒）**。
-//      静态证据：ECP_C2P_CLIENT_INFO.a()=0x00010010 是 C2P 命令码，
-//      手机端 g() 解析车机下发的 CLIENT_INFO（含车机 HUID/channel/flavor），
-//      DisplayService$b.onReceiveClientInfo → u0(Map) 回 0x00010011。
-//      前 7 版一连上就发帧，车机统一回 0x70000011 {"status":false}+RST。
-//   2. 若车机先发 CLIENT_INFO（JSON 含 HUID）→ 取其 HUID 做 RSA 私钥加密，
-//      回 0x00010011 + pubkey + encryptedHUID（u0() 字段集，token=整数 0）。
-//   3. 若 3 秒无首帧（实车观察）→ 兜底发 0x000103F0 + 合并字段集 + RSA 凭证。
-//   4. 授权通过后仪表连入镜像通道 → 0x0072 拉帧，按 0x0071 推 H.264。
+// 【v0.9 决定性纠错（dump(5) + libEPSDK.so 反汇编 + 原厂 logcat）】
+//   · 0x70000011 {"status":false} 来自【PXC 会话准入层】，不是 handleClientInfo：
+//     handleClientInfo(@0x1bebec) 失败只回 0x80000030、成功回 0x00010011，
+//     函数体内没有 "status" 字符串、没有 0x70000011 常量，也不调用
+//     checkPermission / checkClientPXCAuth。所以 v0.1~v0.8 六种载荷都没被解析。
+//   · 准入层 checkClientPXCAuth(channel, uuid) 查本地 pxc_auth_file 的
+//     channel&&uuid 记录 → 授权的是【原厂 App 的 (channel, phoneUUID) 组合】。
+//     v0.8 用 channel=9975 + 随机 32 位 UUID，永远命中不了。
+//   · 原厂真实身份（用户此前抓的 logcat，静态可得，无需再测）：
+//       Link(channel)=44001 / LinkFlavor=50
+//       phoneUUID=45f68d78-cd77-4c1a-a8cd-080249272b48（★ 带连字符）
+//       Xiaomi / 2206122SC / Android / 35 / versionCode=37
+//   · dump(5) 两次会话 3 秒静默实证：车机【从不主动发首帧】，它在等手机先上报。
+//     v0.8「先静默等待车机 CLIENT_INFO」的假设被证伪 → v0.9 连上立即发。
+//
+// 【会话流程 v0.9】
+//   1. 连上 10930 → 立即发 0x000103F0 + 原厂身份 + RSA 凭证。
+//   2. 若车机先发带 HUID 的 CLIENT_INFO（本车未观察到）→ 回 0x00010011。
+//   3. 准入通过后车机连入镜像通道 → 0x0072 拉帧，按 0x0071 推 H.264。
 //
 // 【RSA 凭证】见 CarbitLinkIdentity.swift。密钥本地生成并长期复用，
-// 不需要仪表侧确认 / 扫码 / 蓝牙 / 定位（ClientVerify.clearRefuseList 只清手机本地名单）。
+// 不需要蓝牙 / 热点 / 定位（ClientVerify.clearRefuseList 只清手机本地名单）。
 //
 
 import Foundation
@@ -42,24 +51,25 @@ final class CarbitLinkOutput {
         var height: Int = 640
         var wantFps: Int = 0
         var bitRate: Int = 3_145_728
-        /// 【v0.8】车机 HUID 来自二维码 sn（WiFiDirectReceiver.saveConnectInfo
-        /// → ClientVerify.setCarUUID(sn)，日志 "setCarUUID: %s from qrResult"）。
-        /// 之前从 SSID 猜的 5478C9665F12 是错的，且二维码里根本没有该值。
+        /// 【v0.9】准入层校验的是 (channel, phoneUUID)，必须照搬原厂 App：
+        /// logcat `Link:44001 / LinkFlavor:50 / phoneUUID:45f68d78-…`。
+        /// v0.8 的 channel=9975 + 随机 32 位 UUID 是致命回归，已废弃。
+        var clientIdentity = CarbitLinkWire.ClientIdentity()
+        /// 车机 HUID（二维码 sn=ehCs）。
         var huid: String = "ehCs"
         var huName: String = "ufCX"
-        /// 【v0.8】channel 不再用二维码的 44001 —— 44001 是 modelid。
-        /// checkFlavor 白名单里 net.easyconn.carman.easyride 对应 9975。
+        /// 本车实测 channel（logcat `Link:44001` / mDNS TXT / 二维码 modelid）。
         var flavor: Int = 50
-        var channel: Int = 9975
+        var channel: Int = 44001
         var sdkVersion: String = "5.1.1"
-        var phoneOsVersion: String = "26.4.1"
-        var phoneModel: String = "iPhone"
+        var phoneOsVersion: String = "35"
+        var phoneModel: String = "2206122SC"
         /// 二维码原文参数（本车实测，qr-decoded.txt）。
         var sn: String = "ehCs"
         var modelId: String = "44001"
         var wifiMac: String = "4B:F8:5F:0A:B2:E3"
         var qrAction: Int = 128
-        /// 静默等待车机首帧的秒数；超时后才走兜底主动上报。
+        /// 【v0.9】车机不主动发首帧，此值只用于「立即发送失败后」的兜底重试窗口。
         var carInfoWaitSeconds: Double = 3.0
         /// 把收发的每个字节都记进 dump 文件，便于离线分析未知指令码。
         var dumpsBytes: Bool = true
@@ -213,17 +223,18 @@ final class CarbitLinkOutput {
     }
 
     private func beginControlSession() {
-        // 【v0.8 核心修复】不再抢先发第一帧。
-        // ECP_C2P_CLIENT_INFO.a()=0x00010010 是【车机→手机】的 CLIENT_INFO：
-        // 手机端 g() 解析车机下发的 HUID/channel/flavor，
-        // DisplayService$b.onReceiveClientInfo → u0(Map) 回 0x00010011。
-        // v0.1~v0.7 一连上就发帧，车机统一回 0x70000011 {"status":false}+RST。
-        log("控制通道就绪：先静默等待车机首帧 \(config.carInfoWaitSeconds)s（v0.8 不再抢发）")
+        // 【v0.9】dump(5) 两次会话实证：车机在 10930 上【从不主动发首帧】，
+        // 它在等手机先上报 CLIENT_INFO。v0.8「先静默等 3 秒」的假设被证伪。
+        // 静态证据一致：0x70000011 {"status":false} 来自 PXC 准入层
+        // （checkClientPXCAuth），不是 handleClientInfo 的任何失败分支。
+        log("控制通道就绪：v0.9 立即上报 CLIENT_INFO（车机不主动发首帧，dump(5) 实证）")
         if let connection = control {
             receive(on: connection, tag: "ctl")
         }
+        sendProactiveClientInfo()
 
-        // 车机若始终不说话（v0.7 实车观察），3 秒后走兜底主动上报。
+        // 保留一次兜底：仅当立即发送因 RSA 身份未就绪等原因没发成时重试。
+        // didSendProactiveInfo 已置位时这里直接返回，不会重复发帧。
         let generation = controlGeneration
         let wait = config.carInfoWaitSeconds
         queue.asyncAfter(deadline: .now() + wait) { [weak self] in
@@ -233,32 +244,26 @@ final class CarbitLinkOutput {
         }
     }
 
-    /// 兜底：发 0x000103F0 + 合并字段集 + 真实 RSA 凭证。
+    /// 【v0.9】连上 10930 立即上报：0x000103F0 + 原厂身份 + 真实 RSA 凭证。
     private func sendProactiveClientInfo() {
         guard let identity = identity else {
-            log("⚠️ 无 RSA 身份，兜底 CLIENT_INFO 未发送")
+            log("⚠️ 无 RSA 身份，CLIENT_INFO 未发送（等待兜底重试）")
             return
         }
         didSendProactiveInfo = true
-        let huid = config.huid.isEmpty ? config.sn : config.huid
+        let who = config.clientIdentity
         let encrypted: String
         do {
-            encrypted = try identity.encryptedHUID(huid)
+            encrypted = try identity.encryptedHUID(who.huid)
         } catch {
             log("⚠️ HUID 加密失败：\(error.localizedDescription)")
             return
         }
         let info = CarbitLinkWire.clientInfoJSON(
-            huid: huid, huName: config.huName,
-            flavor: config.flavor, channel: config.channel,
-            sdkVersion: config.sdkVersion,
-            phoneOsVersion: config.phoneOsVersion, phoneModel: config.phoneModel,
-            phoneUUID: Self.stablePhoneUUID(),
-            pubkey: identity.publicKeyBase64, encryptedHUID: encrypted,
-            sn: config.sn, modelId: config.modelId,
-            wifiMac: config.wifiMac, qrAction: config.qrAction
+            identity: who,
+            pubkey: identity.publicKeyBase64, encryptedHUID: encrypted
         )
-        log("车机 \(config.carInfoWaitSeconds)s 未发首帧 → 兜底上报 CLIENT_INFO 0x000103F0："
+        log("上报 CLIENT_INFO 0x000103F0（channel=\(who.channel) phoneUUID=\(who.phoneUUID)）："
             + "\(String(data: info, encoding: .utf8) ?? "-")")
         if let frame = try? CarbitLinkWire.pxcFrame(cmd: CarbitLinkWire.PXC.clientInfo, payload: info) {
             send(frame, on: control, tag: "ctl")
@@ -266,14 +271,16 @@ final class CarbitLinkOutput {
     }
 
     /// 收到车机下发的 CLIENT_INFO → 回 0x00010011（u0() 字段集）。
+    /// 【v0.9】若已经主动上报过，就不再回，避免一会话发两帧。
     private func replyToCarClientInfo(_ carHUID: String, channel: String, flavor: Int,
                                      sdkVersion: String, on connection: NWConnection,
                                      requestCode: UInt32) {
-        guard !didReplyToCarInfo, let identity = identity else {
-            log("⚠️ 无 RSA 身份或已应答，跳过 CLIENT_INFO 应答")
+        guard !didReplyToCarInfo, !didSendProactiveInfo, let identity = identity else {
+            log("⚠️ 无 RSA 身份 / 已应答 / 已主动上报，跳过 CLIENT_INFO 应答")
             return
         }
         didReplyToCarInfo = true
+        let who = config.clientIdentity
         let encrypted: String
         do {
             encrypted = try identity.encryptedHUID(carHUID)
@@ -282,9 +289,8 @@ final class CarbitLinkOutput {
             return
         }
         let reply = CarbitLinkWire.clientInfoReplyJSON(
-            carHUID: carHUID, pubkey: identity.publicKeyBase64, encryptedHUID: encrypted,
-            phoneUUID: Self.stablePhoneUUID(), phoneOsVersion: config.phoneOsVersion,
-            phoneModel: config.phoneModel, supportFunction: config.qrAction
+            identity: who, carHUID: carHUID,
+            pubkey: identity.publicKeyBase64, encryptedHUID: encrypted
         )
         let replyCode = CarbitLinkWire.PXC.carClientInfoReply
         log("★ 收到车机 CLIENT_INFO（cmd=0x\(String(format: "%08X", requestCode))，"
@@ -295,14 +301,10 @@ final class CarbitLinkOutput {
         }
     }
 
-    /// 稳定的手机 UUID（对齐 debug/a.g(Context)，同一安装长期不变）。
+    /// 【v0.9】原厂 App 的 phoneUUID（logcat `phoneUUID : 45f68d78-…`）。
+    /// 准入层 checkClientPXCAuth 查的就是它，绝不能随机生成。
     static func stablePhoneUUID() -> String {
-        let key = "carbitlink.phone.uuid"
-        let defaults = UserDefaults.standard
-        if let saved = defaults.string(forKey: key), !saved.isEmpty { return saved }
-        let fresh = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        defaults.set(fresh, forKey: key)
-        return fresh
+        CarbitLinkWire.ClientIdentity().phoneUUID
     }
 
     // MARK: - 镜像通道（监听，仪表连入）
@@ -429,9 +431,12 @@ final class CarbitLinkOutput {
                 }
                 let flat = json.filter { !$0.isWhitespace }
                 if code == CarbitLinkWire.PXC.clientInfoReply, flat.contains("\"status\":false") {
-                    log("⚠️ 车机回了统一 NACK（服务号 0x7000 + 操作码 0x0011，0x3addd 码表）。"
-                        + " 说明本次 CLIENT_INFO 仍未过 checkPermission / checkClientPXCAuth；"
-                        + " 本版已补齐 RSA pubkey+encryptedHUID、token=0、HUID=sn、channel=9975。")
+                    log("⚠️ 车机准入层回 0x70000011 {\"status\":false}（不是 handleClientInfo 的应答）。"
+                        + " 反汇编实证：handleClientInfo 失败只回 0x80000030、成功回 0x00010011，"
+                        + " 函数体内无 status 串也无 0x70000011，且不调用 checkClientPXCAuth。"
+                        + " → 载荷根本没被解析，卡在 PXC 会话准入（pxc_auth_file 的 channel&&uuid）。"
+                        + " v0.9 已改用原厂 (channel=44001, phoneUUID=45f68d78-…) 身份；"
+                        + " 若仍是这一帧，则仪表授权文件里没有该记录，纯侧载无法自证。")
                 }
             }
             log(text)
@@ -552,7 +557,8 @@ final class CarbitLinkOutput {
         write("# 目标 host=\(config.host):\(config.controlPort)（PXC 控制通道）")
         write("# 镜像通道监听=\(listenText)（等待仪表连入）")
         write("# 本机 Wi-Fi 地址=\(ip)")
-        write("# 采集参数=\(config.width)x\(config.height) @\(config.bitRate)bps huid=\(config.huid.isEmpty ? "-" : config.huid)")
+        write("# 采集参数=\(config.width)x\(config.height) @\(config.bitRate)bps huid=\(config.clientIdentity.huid)")
+        write("# 客户端身份 v0.9：channel=\(config.clientIdentity.channel) phoneUUID=\(config.clientIdentity.phoneUUID) flavor=\(config.clientIdentity.flavor)")
     }
 
     /// 当前 Wi-Fi 口地址，写进 dump 方便判断"手机到底在哪个网段"。
