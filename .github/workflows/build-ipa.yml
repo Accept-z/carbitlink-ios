@@ -60,7 +60,15 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
-            build 2>&1 | tail -60
+            build 2>&1 | tee xcodebuild.log
+
+      - name: 提取编译错误
+        if: failure()
+        run: |
+          echo "===== error 行 ====="
+          grep -nE "(^| )error: |fatal error: " xcodebuild.log | head -60 || echo "(没有匹配到 error: 行)"
+          echo "===== 失败命令 ====="
+          grep -nE "The following build commands failed|BUILD FAILED" -A 8 xcodebuild.log | head -40 || true
 
       - name: 打包未签名 IPA
         run: |
