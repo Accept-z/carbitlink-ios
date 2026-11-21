@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // CarbitLinkWire.swift
-// 亿连（CarbitLink）线上格式 —— v0.4，按 libEPSDK.so 反汇编重写。
+// 亿连（CarbitLink）线上格式 —— v0.7，按 libEPSDK.so 静态逆向重写握手层。
 //
-// 【证据链（2026-11-21，easyride APK 内 libEPSDK.so，与车机端同一二进制）】
+// 【证据链（2026-11-21，easyride APK 内 libEPSDK.so；两端 MD5 完全相同）】
 //   · PXCService::sendCMD / recvCMD / checkCMD（@0x1bdcd0 / 0x1be044 / 0x1bdc84）：
 //     控制通道（10930）的帧头固定 16 字节 ——
 //       [0..3]  cmd   u32 LE   指令码（高 16 位服务号，低 16 位操作码）
@@ -14,15 +14,18 @@
 //     = cmd 0x70000011 / total 36 / 校验 0x70000035，且 0x70000011^0x24=0x70000035 ✓
 //   · MirrorService::sendCMD（@0x1d5a38）：镜像通道帧头 8 字节 ——
 //       [0..1] code u16 LE   [2..3] len u16 LE   [4..7] param u32 LE
-//     与 Android logcat `rec First 0 [72,00,00,00,00,00,00,00]` 完全吻合。
-//   · C2PMainService::handleCMD（@0x1be944）的 switch：仪表接受 19 个 0x0001xxxx 指令，
-//     其中 0x00010010（开始镜像）、0x000103B0（CheckCarUUID，回 0x000103B1）、
-//     0x000103E0（CheckSN）。PXCService::getCheckUUIDCmd=0x000103B0 交叉验证一致。
-//   · 仪表→手机的推送走 0x7000xxxx 服务号（实车收到过 0x70000011）。
+//   · 【v0.7 纠错】C2PMainService::handleCMD（@0x1be944）的 PLT 桩分发表：
+//       0x00010010 → handleNightMode（夜间模式，❌ 旧表误标「开始镜像」）
+//       0x00010020 → handleBtnEvent   0x000103B0 → handleCheckCarUUID（回 ...3B1）
+//       0x000103E0 → handleCheckSN    0x000103F0 → handleClientInfo ★
+//     此前 6 版从没发过 CLIENT_INFO，仪表一律以 {"status":false}+RST 拒绝。
+//   · handleClientInfo（@0x1bebec）解析的 JSON 字段全表见 clientInfoJSON(:)。
+//   · 授权链：checkPermission(flavor,channel) / checkClientPXCAuth /
+//     onRequestPXCPermission / updateClientPXCAuthInfo —— 首次连接需仪表侧确认。
 //
 // 【仍未确认 —— dump 里会直接看到】
-//   · 手机推帧的镜像码：暂定 0x0071（TODO probe）。
-//   · 心跳应答码：先原样回显。
+//   · encryptedHUID 的明文格式与 token/challenge（车机侧下发，静态不可见）。
+//   · 手机推帧的镜像码：暂定 0x0071（TODO probe）；心跳应答码：先原样回显。
 //
 
 import Foundation
@@ -48,17 +51,24 @@ final class CarbitLinkWire {
     }
 
     /// PXC 控制通道指令（32 位）。低 16 位是操作码，高 16 位是服务号。
+    /// 由 C2PMainService::handleCMD 的 PLT 桩分发表静态重建，勿再照旧表猜。
     enum PXC {
-        /// 手机 → 仪表：请求开始镜像。
-        static let startMirror: UInt32 = 0x00010010
-        /// 手机 → 仪表：身份校验，负载为 JSON {"HUID":…,"HUName":…}。
+        /// 手机 → 仪表：**会话第一帧**，上报客户端信息 JSON（见 clientInfoJSON）。
+        /// 车机端 handleClientInfo（@0x1bebec）处理，缺它则一律 {"status":false}+RST。
+        static let clientInfo: UInt32 = 0x000103F0
+        /// 校验回复码规律：请求 +1。
         static let checkCarUUID: UInt32 = 0x000103B0
-        /// 仪表 → 手机：身份校验回复。
         static let checkCarUUIDReply: UInt32 = 0x000103B1
-        /// 手机 → 仪表：序列号校验。
         static let checkSN: UInt32 = 0x000103E0
-        /// 屏幕触摸。
-        static let screenTouch: UInt32 = 0x00010020
+        /// 0x00010010 实为 handleNightMode；0x00010020 为 handleBtnEvent。
+        /// 都不是「开始镜像」，保留常量仅为对照 dump，勿用于发起会话。
+        static let nightMode: UInt32 = 0x00010010
+        static let btnEvent: UInt32 = 0x00010020
+        /// 手机 → 仪表：屏幕信息（P2C，P2CMainService::notifyAppStatusChanged）。
+        static let screenInfo: UInt32 = 0x00020020
+        static let requestStartMirror: UInt32 = 0x000201C0
+        /// 仪表 → 手机：ClientInfoRly/status（实车 0x70000011，{\n\t"status":\tfalse\n}）。
+        static let clientInfoReply: UInt32 = 0x70000011
     }
 
     /// 镜像通道指令（16 位）。
@@ -142,10 +152,43 @@ final class CarbitLinkWire {
         try Self.mirrorFrame(code: MirrorCode.videoFrame.rawValue, payload: annexB)
     }
 
-    /// 握手 JSON（CheckCarUUID 的负载）。HUID 用仪表 MAC 的十六进制大写形式。
-    static func handshakeJSON(huid: String, huName: String) -> Data {
-        let object: [String: Any] = ["HUID": huid, "HUName": huName]
-        return (try? JSONSerialization.data(withJSONObject: object, options: [])) ?? Data()
+    /// 【v0.7】会话第一帧 `0x000103F0 CLIENT_INFO` 的 JSON 负载。
+    /// 字段名逐一来自 handleClientInfo（@0x1bebec）的 adrp+add 字符串交叉引用：
+    ///   sdkVersion / flavor / channel / HUID / HUName / encryptedHUID / token /
+    ///   supportFunction / productType / supportMic / package_name / screenType /
+    ///   wakeupWord / supportBackDesktop / phoneOs / phoneOsVersion / phoneModel / phoneBrand
+    /// 校验链（车机端日志原文）：
+    ///   "huid is empty" → "flavor or channel is not exist" →
+    ///   "flavor or channel is not match" → checkPermission → checkClientPXCAuth
+    /// 已知实测值（Android 抓包 + mDNS TXT）：huid=5478C9665F12, HUName=ufCX,
+    /// flavor=50, channel=44001, phoneType=IOS(=1)。
+    /// encryptedHUID/token 静态不可构造（RSA 明文 + 车机下发的 challenge），留空让仪表回
+    /// ClientInfoRly 时把真实应答打进 dump —— 这是本版最重要的可观测目标。
+    static func clientInfoJSON(
+        huid: String, huName: String, flavor: Int, channel: Int,
+        sdkVersion: String, phoneOsVersion: String, phoneModel: String
+    ) -> Data {
+        let object: [String: Any] = [
+            "sdkVersion": sdkVersion,
+            "flavor": flavor,
+            "channel": channel,
+            "HUID": huid,
+            "HUName": huName,
+            "encryptedHUID": "",
+            "token": "",
+            "supportFunction": 0,
+            "productType": 0,
+            "supportMic": false,
+            "package_name": "net.easyconn.carman.easyride",
+            "screenType": 1,
+            "wakeupWord": "",
+            "supportBackDesktop": false,
+            "phoneOs": "iOS",
+            "phoneOsVersion": phoneOsVersion,
+            "phoneModel": phoneModel,
+            "phoneBrand": "Apple"
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
     }
 
     // MARK: - 拆包（接收）
@@ -205,13 +248,17 @@ final class CarbitLinkWire {
     private static func classify(low16: UInt16, fullCode: UInt32, payload: Data, framing: Framing, version: UInt32) -> [Event] {
         switch low16 {
         case 0x0010:
-            // CLIENT_INFO（仪表能力上报）是 JSON；只有真解析出 protobuf 采集参数才算 start。
+            // 镜像通道的启动/采集参数（8 字节头）；JSON 一律不当采集参数。
             let cfg = decodeMirrorConfig(payload)
             if let cfg { return [.start(cfg)] }
             if payload.first == UInt8(ascii: "{") {
                 return [.unknown(code: fullCode, payload: payload, framing: framing)]
             }
             return [.start(nil)]
+        case 0x0011:
+            // 0x70000011 = ClientInfoRly/status。实车载荷 {\n\t"status":\tfalse\n}
+            // 是车机端授权层拒绝，绝不是启动指令。归入 unknown 让上层打 JSON 文本。
+            return [.unknown(code: fullCode, payload: payload, framing: framing)]
         case MirrorCode.ready.rawValue:
             return [.ready]
         case MirrorCode.frameRequest.rawValue:
