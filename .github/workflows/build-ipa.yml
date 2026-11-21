@@ -26,6 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 校验源码版本
+        run: |
+          echo "HEAD = $(git rev-parse HEAD)"
+          echo "CarbitLinkOutput.swift md5 = $(md5 -q App/CarbitLinkOutput.swift)"
+          echo "HUID 出现次数 = $(grep -c '5478C9665F12' App/CarbitLinkOutput.swift || true)"
+          echo "allowLocalEndpointReuse = $(grep -c 'allowLocalEndpointReuse' App/CarbitLinkOutput.swift || true)"
+
       - name: 环境信息
         run: |
           sw_vers
