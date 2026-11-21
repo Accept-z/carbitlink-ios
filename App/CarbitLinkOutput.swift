@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // CarbitLinkOutput.swift
-// 亿连（CarbitLink）仪表输出 —— v0.4，按 libEPSDK.so 反汇编结论重写。
+// 亿连（CarbitLink）仪表输出 —— v0.7，按 libEPSDK.so 静态逆向修正握手层。
 //
 // 【拓扑（已由反汇编 + 实车双重确认）】
 //   · iPhone 连仪表热点 kt_ap_xxxx（仪表即网关，实测 192.168.1.1）。
@@ -10,11 +10,17 @@
 //     10920/10921/10922，仪表连入；实车：仪表的 10920/10922 拒绝外连）。
 //     所以 iOS 端必须在 10920/10921/10922 上【监听】而不是拨出。
 //
-// 【会话流程（按反汇编指令表）】
-//   1. 连上 10930 → 发 CheckCarUUID(0x000103B0, JSON{HUID,HUName})
-//   2. 发 请求开始镜像(0x00010010, protobuf 采集参数)
-//   3. 仪表应答（0x000103B1 / 采集参数 0x0011…，全部按 dump 落盘）
-//   4. 仪表连入镜像通道 → 0x0072 拉帧，我们按 0x0071 推 H.264（TODO probe）
+// 【会话流程（v0.7 · 静态逆向重建，推翻 v0.1~v0.6）】
+//   1. 连上 10930 → **第一帧必须发 CLIENT_INFO(0x000103F0, JSON 18 字段)**。
+//      旧版发的是裸握手 / 0x000103B0 / 0x00010010 / 0x00020020，全都缺这一帧，
+//      仪表一律回 0x70000011 {"status":false} + RST —— 六版失败的根因。
+//   2. 仪表走 checkPermission(flavor,channel) → checkClientPXCAuth →
+//      onRequestPXCPermission（首次连接可能需仪表屏确认）。
+//   3. 若应答带回 token/challenge，才有后续 encryptedHUID 与镜像协商。
+//   4. 仪表连入镜像通道 → 0x0072 拉帧，我们按 0x0071 推 H.264（TODO probe）。
+//
+// 【诚实的可行性边界】encryptedHUID 的 RSA 明文格式与 token 由车机侧下发，
+// 静态不可复现；纯 iOS 侧载 App 能否过授权仍需一次实车观测（dump 会记录真实应答）。
 //
 
 import Foundation
@@ -42,6 +48,13 @@ final class CarbitLinkOutput {
         /// v0.5 实车验证：空 HUID 会被仪表以 {"status":false} 拒绝并断连。
         var huid: String = "5478C9665F12"
         var huName: String = "ufCX"
+        /// 【v0.7】CLIENT_INFO 字段（来自 mDNS TXT 实测与 handleClientInfo 校验链）。
+        /// 车机端会拿这两个值和自己广播的 flavor/channel 比对，不匹配直接拒绝。
+        var flavor: Int = 50
+        var channel: Int = 44001
+        var sdkVersion: String = "5.1.1"
+        var phoneOsVersion: String = "26.4.1"
+        var phoneModel: String = "iPhone"
         /// 把收发的每个字节都记进 dump 文件，便于离线分析未知指令码。
         var dumpsBytes: Bool = true
     }
@@ -172,26 +185,26 @@ final class CarbitLinkOutput {
     }
 
     private func beginControlSession() {
-        // P2C 族（手机→仪表）负载是 JSON，不是 protobuf。
-        // 0x00020020 = 设置镜像模式：{"mode":2,"displayRotation":0,"width":W,"height":H}
-        // （反汇编 P2C/c，模式 2 = 整屏直播；字段名直接来自 dex 字符串表）
-        // 此前的 0x000103B0 / 0x00010010 都是 C2P（仪表→手机）方向的指令，方向发反了。
-        let mirrorSetup: [String: Any] = [
-            "mode": 2,
-            "displayRotation": 0,
-            "width": config.width,
-            "height": config.height
-        ]
-        var payload = (try? JSONSerialization.data(withJSONObject: mirrorSetup, options: [.sortedKeys])) ?? Data()
-        let payloadText = String(data: payload, encoding: .utf8) ?? "-"
-        log("发送镜像模式 0x00020020：\(payloadText)")
-        if let frame = try? CarbitLinkWire.pxcFrame(cmd: 0x00020020, payload: payload) {
+        // 【v0.7 · 静态逆向结论】10930 会话第一帧必须是 0x000103F0 CLIENT_INFO。
+        // 旧实现（v0.1~v0.6）分别发过裸握手 JSON / 0x000103B0 / 0x00010010 /
+        // 0x00020020，全都缺这一帧，仪表一律回 {"status":false} 然后 RST ——
+        // 六版失败的根本原因。字段全表来自 handleClientInfo(@0x1bebec) 的字符串交叉引用。
+        let info = CarbitLinkWire.clientInfoJSON(
+            huid: config.huid, huName: config.huName,
+            flavor: config.flavor, channel: config.channel,
+            sdkVersion: config.sdkVersion,
+            phoneOsVersion: config.phoneOsVersion, phoneModel: config.phoneModel
+        )
+        log("发送 CLIENT_INFO 0x000103F0（第一帧）：\(String(data: info, encoding: .utf8) ?? "-")")
+        if let frame = try? CarbitLinkWire.pxcFrame(cmd: CarbitLinkWire.PXC.clientInfo, payload: info) {
             send(frame, on: control, tag: "ctl")
         }
 
-        // 应答位置预留：仪表若发来开始请求（带 id），在 handle() 里回 0x000201C0
-        // {"isOk":true,"errCode":0,"errMsg":"","id":<对方 id>,"client_set":<参数串>}。
-        // 现在先发模式设置，等仪表的应答（CLIENT_INFO / 开始请求）进 dump。
+        // 仪表应答观测点：
+        //   · 回 ClientInfoRly（0x70000011 或 ...3F1）带 token/challenge → 授权链已启动，
+        //     dump 里会有真实字段，可据此决定下一步（encryptedHUID 复现 / 仪表侧确认）。
+        //   · 仍回 {"status":false} + RST → 说明 flavor/channel/加密HUID 未过校验，
+        //     或仪表侧首次授权未确认。所有字节都会进 dump，不需要再猜。
         if let connection = control {
             receive(on: connection, tag: "ctl")
         }
@@ -311,6 +324,11 @@ final class CarbitLinkOutput {
             if payload.first == UInt8(ascii: "{"),
                let json = String(data: payload, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !json.isEmpty {
                 text += "  JSON: \(json)"
+                let flat = json.filter { !$0.isWhitespace }
+                if code == CarbitLinkWire.PXC.clientInfoReply, flat.contains("\"status\":false") {
+                    log("⚠️ 仪表在授权层拒绝本次连接（CLIENT_INFO 未通过 checkPermission / checkClientPXCAuth）。"
+                        + " 可能原因：flavor/channel 与仪表不匹配、encryptedHUID 为空、或首次连接需在仪表屏确认授权。")
+                }
             }
             log(text)
         }
