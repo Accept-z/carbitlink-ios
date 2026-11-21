@@ -37,8 +37,11 @@ final class CarbitLinkOutput {
         var wantFps: Int = 0
         var bitRate: Int = 3_145_728
         /// 仪表 huid（仪表 MAC 十二位十六进制大写），用于身份校验。
-        var huid: String = ""
-        var huName: String = ""
+        /// 本车实测值来自 Android 抓包（亿连骑行 logcat）——
+        /// 54:78:C9:66:5F:12，与热点名 kt_ap_665F12 / 蓝牙名 BXEY_665F13 尾部吻合。
+        /// v0.5 实车验证：空 HUID 会被仪表以 {"status":false} 拒绝并断连。
+        var huid: String = "5478C9665F12"
+        var huName: String = "ufCX"
         /// 把收发的每个字节都记进 dump 文件，便于离线分析未知指令码。
         var dumpsBytes: Bool = true
     }
@@ -200,9 +203,13 @@ final class CarbitLinkOutput {
     private func startMirrorListeners() {
         for port in config.listenPorts {
             guard let nwPort = NWEndpoint.Port(rawValue: port) else { continue }
+            // 快速 Stop/Start 重开会撞 EADDRINUSE（上一轮监听的关闭是异步的），
+            // 允许端口复用。
+            let parameters = NWParameters.tcp
+            parameters.allowLocalEndpointReuse = true
             let listener: NWListener
             do {
-                listener = try NWListener(using: .tcp, on: nwPort)
+                listener = try NWListener(using: parameters, on: nwPort)
             } catch {
                 log("无法监听 \(port)：\(error.localizedDescription)")
                 continue
@@ -300,7 +307,13 @@ final class CarbitLinkOutput {
             }
         case .unknown(let code, let payload, let framing):
             let kind = framing == .pxc ? "PXC" : "镜像"
-            log("[\(tag)] \(kind)指令 0x\(String(format: "%08X", code))，\(payload.count) 字节：\(payload.hexDump(limit: 64))")
+            var text = "[\(tag)] \(kind)指令 0x\(String(format: "%08X", code))，\(payload.count) 字节：\(payload.hexDump(limit: 64))"
+            // 载荷常是 JSON 状态（实车收到 {"status": false}），直接打文本更好读。
+            if payload.first == UInt8(ascii: "{"),
+               let json = String(data: payload, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !json.isEmpty {
+                text += "  JSON: \(json)"
+            }
+            log(text)
         }
     }
 
