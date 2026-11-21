@@ -78,6 +78,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         super.viewDidLoad()
         title = "TDS Car Kit"
         view.backgroundColor = .systemGroupedBackground
+        // App 一启动就把 dump 建出来：否则没连上过仪表时「文件」App 里根本没有这个文件，
+        // 会被误判成功能没生效。
+        CarbitLinkOutput.ensureDumpFile()
         navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "gearshape"), style: .plain, target: self, action: #selector(toggleSettings))
         navigationItem.rightBarButtonItem?.accessibilityLabel = "Settings"
         locationManager.delegate = self
@@ -151,8 +154,14 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         let carbitRow = UIStackView(arrangedSubviews: [carbitTitle, carbitLinkSwitch]); carbitRow.spacing = 12
         let carbitNote = UILabel(); carbitNote.numberOfLines = 0
         carbitNote.font = .preferredFont(forTextStyle: .caption1); carbitNote.textColor = .secondaryLabel
-        carbitNote.text = "不改写视频，只多开一路输出给亿连仪表。原始字节会写入 Documents/carbitlink-dump.log。"
-        let carbitBox = UIStackView(arrangedSubviews: [carbitRow, carbitHostField, carbitNote])
+        carbitNote.text = "不改写视频，只多开一路输出给亿连仪表。原始字节与连接日志写入 Documents/carbitlink-dump.log。"
+        // 导出按钮：不用再去「文件」App 里翻。dump 文件始终存在（App 启动即创建）。
+        let dumpExport = UIButton(type: .system); dumpExport.setTitle("导出 dump 文件", for: .normal)
+        dumpExport.addTarget(self, action: #selector(exportDump), for: .touchUpInside)
+        let dumpClear = UIButton(type: .system); dumpClear.setTitle("清空 dump", for: .normal)
+        dumpClear.addTarget(self, action: #selector(clearDump), for: .touchUpInside)
+        let dumpRow = UIStackView(arrangedSubviews: [dumpExport, dumpClear]); dumpRow.spacing = 16
+        let carbitBox = UIStackView(arrangedSubviews: [carbitRow, carbitHostField, carbitNote, dumpRow])
         carbitBox.axis = .vertical; carbitBox.spacing = 8
         settingsStack.addArrangedSubview(carbitBox)
         contentStack = stack
@@ -547,17 +556,45 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     /// 按界面开关启动亿连输出。不改动原有任何输出路径，只多开一路。
     private func startCarbitLinkIfEnabled() {
         UserDefaults.standard.set(carbitLinkSwitch.isOn, forKey: "carbitLinkEnabled")
-        let host = (carbitHostField.text ?? "").trimmingCharacters(in: .whitespaces)
-        UserDefaults.standard.set(host, forKey: "carbitLinkHost")
+        var host = (carbitHostField.text ?? "").trimmingCharacters(in: .whitespaces)
         guard carbitLinkSwitch.isOn else { return }
+        // 没填就从本机 Wi-Fi 地址推网关（192.168.49.2 → 192.168.49.1），少一步手填也少一处手误。
+        if host.isEmpty, let guess = CarbitLinkOutput.suggestedGateway() {
+            host = guess
+            carbitHostField.text = guess
+            log("仪表 IP 未填，已按本机网段推断为 \(guess)")
+        }
         guard !host.isEmpty else {
             log("亿连输出已开启，但没填仪表 IP。先连上仪表热点，把网关地址（如 192.168.49.1）填进设置。")
             return
         }
+        UserDefaults.standard.set(host, forKey: "carbitLinkHost")
         var configuration = CarbitLinkOutput.Configuration()
         configuration.host = host
         carbitLink.start(configuration: configuration)
         log("亿连输出已启动，目标 \(host)")
+    }
+
+    /// 一键把 dump 甩出去（AirDrop / 发自己 / 存文件），不用翻「文件」App 找。
+    @objc private func exportDump() {
+        view.endEditing(true)
+        guard let url = CarbitLinkOutput.ensureDumpFile() else {
+            log("取不到 Documents 路径，无法导出 dump")
+            return
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        log("导出 dump：\(url.lastPathComponent)，\(size) 字节")
+        let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = view
+        sheet.popoverPresentationController?.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+        present(sheet, animated: true)
+    }
+
+    @objc private func clearDump() {
+        guard let url = CarbitLinkOutput.dumpURL else { return }
+        try? "".write(to: url, atomically: true, encoding: .utf8)
+        log("dump 已清空，下次启动会重新写入表头")
     }
 
     private func stop() {
