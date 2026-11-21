@@ -145,6 +145,9 @@ final class CarbitLinkWire {
                 events.append(.frameRequest)
             case .heartbeat:
                 events.append(.heartbeat)
+            case .videoFrame, .requestStart:
+                // 这两个是「我方发出」的码，正常不会从对端收到；真收到就按未知处理并转储。
+                events.append(.unknown(code: code, payload: payload))
             case nil:
                 events.append(.unknown(code: code, payload: payload))
             }
