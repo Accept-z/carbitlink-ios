@@ -381,12 +381,16 @@ final class CarbitLinkOutput {
                 self?.log("mDNS 浏览失败：\(error.localizedDescription)")
             }
         }
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
+        browser.browseResultsChangedHandler = { [weak self] (results: Set<NWBrowser.Result>, _: Set<NWBrowser.Result.Change>) in
             guard let self else { return }
             for result in results {
                 var detail = ""
-                if case let .bonjour(txtRecord) = result.metadata, let txtRecord {
-                    let records = txtRecord.dictionary
+                let txtRecord: NWTXTRecord? = {
+                    if case let .bonjour(record) = result.metadata { return record }
+                    return nil
+                }()
+                if let txtRecord {
+                    let records: [String: String] = txtRecord.dictionary
                     let info = CarbitLinkWire.parseTXT(records)
                     detail = " TXT{huid=\(info.huid) port=\(info.port) flavor=\(info.flavor) channel=\(info.channel)}"
                     if !info.huid.isEmpty, self.config.huid.isEmpty {
@@ -396,9 +400,11 @@ final class CarbitLinkOutput {
                 }
                 self.log("mDNS 发现服务 \(result.endpoint)\(detail)")
                 // 服务实例名一般就是仪表的 HUName（对照 Android 抓包里的 "ufCX"）。
-                if case let .service(name, _, _) = result.endpoint, self.config.huName.isEmpty, !name.isEmpty {
-                    self.config.huName = name
-                    self.log("mDNS 取到 HUName=\(name)")
+                if case let NWEndpoint.service(name, _, _) = result.endpoint {
+                    if self.config.huName.isEmpty, !name.isEmpty {
+                        self.config.huName = name
+                        self.log("mDNS 取到 HUName=\(name)")
+                    }
                 }
             }
         }
