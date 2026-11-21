@@ -381,7 +381,7 @@ final class CarbitLinkOutput {
                 self?.log("mDNS 浏览失败：\(error.localizedDescription)")
             }
         }
-        browser.browseResultsChangedHandler = { [weak self] (results: Set<NWBrowser.Result>, _: Set<NWBrowser.Result.Change>) in
+        let handler: (Set<NWBrowser.Result>, Set<NWBrowser.Result.Change>) -> Void = { [weak self] results, _ in
             guard let self else { return }
             for result in results {
                 var detail = ""
@@ -408,6 +408,7 @@ final class CarbitLinkOutput {
                 }
             }
         }
+        browser.browseResultsChangedHandler = handler
         browser.start(queue: queue)
         self.browser = browser
     }
