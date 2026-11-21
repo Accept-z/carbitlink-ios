@@ -1,20 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // CarbitLinkWire.swift
-// 亿连（CarbitLink）线上格式 —— v0.8，按 APK 静态逆向重写握手层。
+// 亿连（CarbitLink）线上格式 —— v0.9，按 APK 静态逆向 + 原厂 logcat 重建握手层。
 //
-// 【v0.8 决定性纠错（classes10.dex / classes2.dex）】
-//   · ECP_C2P_CLIENT_INFO.a() = 0x00010010（C2P CLIENT_INFO 命令码），
-//     u0 父类 e() 里 t.k(a()+1) → 手机应答码 = 0x00010011。
-//   · 实车 0x70000011 是「服务号 0x7000 + 通用操作码 0x0011」状态应答；
-//     0x3addd 起是一整张 0x?0000011 码表，证实 0x0011 是统一 NACK 操作码，
-//     {"status":false} 由 JsonCpp StyledWriter 生成，不是专门针对 CLIENT_INFO。
-//   · 真实握手是【车机先发 0x00010010 CLIENT_INFO（带自身 HUID/channel/flavor）】，
-//     手机端 ECP_C2P_CLIENT_INFO.g() 解析后，DisplayService$b.onReceiveClientInfo
-//     调 u0(Map) 回 0x00010011，携带 pubkey + encryptedHUID（加密车机下发的 HUID）。
-//     因此 v0.8 连上 10930 后【先静默等待车机首帧】，不再抢先发帧。
-//   · u0() 字段集与 native handleClientInfo 解析侧字段集是两套；v0.7 只发了后者
-//     且 encryptedHUID/token 全空 → 车机统一 NACK。v0.8 合并两套字段。
+// 【v0.9 决定性纠错 —— dump(5) 实车 + libEPSDK.so 反汇编 + 原厂 logcat 三方印证】
+//   1. 车机回的 0x70000011 {"status":false} 【不是 handleClientInfo 的任何失败分支】：
+//      · C2PMainService::handleClientInfo（@0x1bebec）失败只回 0x80000030，
+//        成功回 0x00010011；函数体内【没有】"status" 字符串，也【没有】0x70000011 常量，
+//        更【没有】调用 checkPermission / checkClientPXCAuth（bl 目标表已核）。
+//      · libEPSDK.so 里 "status" 只被 4 个 handler 引用，应答码分别是
+//        0x00010411 / 0x00010431 / 0x00010751 …，全都不是 0x70000011。
+//      · 0x70000011 = C2P 服务基址 0x70000000 + 通用状态操作码 0x0011
+//        （0x3addd 起是 0x??000011 一族码表）。
+//      → 拒绝发生在【PXC 会话准入层】，CLIENT_INFO 载荷根本没被解析。
+//        这解释了 v0.1~v0.8 六种完全不同的载荷都收到字节级相同的同一帧。
+//   2. 准入层 EPSDKContext::checkClientPXCAuth(channel, uuid) 查本地
+//      pxc_auth_file 里的 channel&&uuid 记录（readClientPXCAuthFile 解析 JSON 数组，
+//      键为 "channel" / "uuid"）。授权的是【原厂 App 的 (channel, phoneUUID) 组合】。
+//   3. 原厂身份已由用户此前抓的 logcat（AppCommonInfoPrinter）静态给出，无需再测：
+//        Link(channel) = 44001          ← v0.8 误改成 9975，是致命回归
+//        LinkFlavor    = 50
+//        phoneUUID     = 45f68d78-cd77-4c1a-a8cd-080249272b48   ← 带连字符 36 字符
+//        phoneBrand=Xiaomi  phoneModel=2206122SC  phoneOs=Android  phoneOsVersion=35
+//        package=net.easyconn.carman.easyride  versionCode=37  sdkVersion=5.1.1
+//        speechEngineType=2
+//      v0.8 用的随机 32 位无连字符 UUID + channel 9975 永远命中不了授权记录。
+//   4. 车机【从不主动发首帧】（dump(5) 两次会话 3 秒静默实证），
+//      v0.8「先静默等车机 CLIENT_INFO」的假设被证伪；v0.9 连上 10930 立即上报。
 //
 // 【证据链（2026-11-21，easyride APK 内 libEPSDK.so；两端 MD5 完全相同）】
 //   · PXCService::sendCMD / recvCMD / checkCMD（@0x1bdcd0 / 0x1be044 / 0x1bdc84）：
@@ -27,17 +39,13 @@
 //     = cmd 0x70000011 / total 36 / 校验 0x70000035，且 0x70000011^0x24=0x70000035 ✓
 //   · MirrorService::sendCMD（@0x1d5a38）：镜像通道帧头 8 字节 ——
 //       [0..1] code u16 LE   [2..3] len u16 LE   [4..7] param u32 LE
-//   · 【v0.7 纠错】C2PMainService::handleCMD（@0x1be944）的 PLT 桩分发表：
+//   · C2PMainService::handleCMD（@0x1be944）的 PLT 桩分发表：
 //       0x00010010 → handleNightMode（夜间模式，❌ 旧表误标「开始镜像」）
 //       0x00010020 → handleBtnEvent   0x000103B0 → handleCheckCarUUID（回 ...3B1）
 //       0x000103E0 → handleCheckSN    0x000103F0 → handleClientInfo ★
-//     此前 6 版从没发过 CLIENT_INFO，仪表一律以 {"status":false}+RST 拒绝。
-//   · handleClientInfo（@0x1bebec）解析的 JSON 字段全表见 clientInfoJSON(:)。
-//   · 授权链：checkPermission(flavor,channel) / checkClientPXCAuth /
-//     onRequestPXCPermission / updateClientPXCAuthInfo —— 首次连接需仪表侧确认。
 //
 // 【仍未确认 —— dump 里会直接看到】
-//   · encryptedHUID 的明文格式与 token/challenge（车机侧下发，静态不可见）。
+//   · 车机 pxc_auth_file 里是否已有 (44001, 45f68d78-…) 这条授权记录。
 //   · 手机推帧的镜像码：暂定 0x0071（TODO probe）；心跳应答码：先原样回显。
 //
 
@@ -64,39 +72,70 @@ final class CarbitLinkWire {
     }
 
     /// PXC 控制通道指令（32 位）。低 16 位是操作码，高 16 位是服务号。
-    /// 由 C2PMainService::handleCMD 的 PLT 桩分发表静态重建，勿再照旧表猜。
     enum PXC {
-        /// 【v0.8】车机 → 手机：CLIENT_INFO 请求（ECP_C2P_CLIENT_INFO.a()）。
-        /// 载荷是车机自身能力/身份 JSON，含 HUID / channel / flavor / sdkVersion。
-        /// 收到后必须回 0x00010011（u0 父类 e() 里 t.k(a()+1)）。
+        /// 车机 → 手机：CLIENT_INFO 能力通告（ECP_C2P_CLIENT_INFO.a()）。
         static let carClientInfoRequest: UInt32 = 0x00010010
-        /// 【v0.8】手机 → 车机：CLIENT_INFO 应答，载荷见 clientInfoReplyJSON。
+        /// 手机 → 车机：CLIENT_INFO 应答（u0 父类 e() 里 t.k(a()+1)）。
         static let carClientInfoReply: UInt32 = 0x00010011
         /// 手机 → 仪表：native handleClientInfo(@0x1bebec) 的解析侧 CLIENT_INFO 码。
-        /// v0.7 用它抢先发帧被 NACK；v0.8 降级为「车机 3 秒不说话」时的兜底上报。
+        /// v0.9 连上 10930 后立即用它上报身份。
         static let clientInfo: UInt32 = 0x000103F0
         /// 校验回复码规律：请求 +1。
         static let checkCarUUID: UInt32 = 0x000103B0
         static let checkCarUUIDReply: UInt32 = 0x000103B1
         static let checkSN: UInt32 = 0x000103E0
         /// 0x00010010 实为 handleNightMode；0x00010020 为 handleBtnEvent。
-        /// 都不是「开始镜像」，保留常量仅为对照 dump，勿用于发起会话。
         static let nightMode: UInt32 = 0x00010010
         static let btnEvent: UInt32 = 0x00010020
         /// 手机 → 仪表：屏幕信息（P2C，P2CMainService::notifyAppStatusChanged）。
         static let screenInfo: UInt32 = 0x00020020
         static let requestStartMirror: UInt32 = 0x000201C0
-        /// 仪表 → 手机：ClientInfoRly/status（实车 0x70000011，{\n\t"status":\tfalse\n}）。
+        /// 仪表 → 手机：PXC 准入层通用状态帧（实车 0x70000011，{\n\t"status":\tfalse\n}）。
         static let clientInfoReply: UInt32 = 0x70000011
     }
 
     /// 镜像通道指令（16 位）。
     enum MirrorCode: UInt16 {
-        case start        = 0x0010   // 启动/采集参数（低 16 位，PXC 里 0x11 也是它的回复形态）
+        case start        = 0x0010
         case ready        = 0x0070
         case frameRequest = 0x0072
         case heartbeat    = 0x0040
         case videoFrame   = 0x0071   // TODO(probe)：手机推帧码，暂定
+    }
+
+    // MARK: - 【v0.9】客户端身份（原厂 App 实测值，准入层按 channel+phoneUUID 校验）
+
+    /// 全部取自用户此前抓取的原厂 logcat（AppCommonInfoPrinter）与二维码。
+    /// 车机 EPSDKContext::checkClientPXCAuth(channel, uuid) 查 pxc_auth_file 时
+    /// 用的就是 channel 与 phoneUUID，所以这里必须【照搬原厂】，不能自己随机生成。
+    struct ClientIdentity {
+        /// 二维码 sn=ehCs（WiFiDirectReceiver.saveConnectInfo → ClientVerify.setCarUUID(sn)）。
+        var huid: String = "ehCs"
+        var huName: String = "ufCX"
+        /// logcat: LinkFlavor: 50
+        var flavor: Int = 50
+        /// logcat: Link:44001 —— 也是二维码 modelid、mDNS TXT channel。
+        /// v0.8 误改成 9975 是错的，v0.9 恢复。
+        var channel: Int = 44001
+        var sdkVersion: String = "5.1.1"
+        var pxcVersion: String = "1.0.2"
+        /// logcat: phoneUUID : 45f68d78-cd77-4c1a-a8cd-080249272b48
+        /// ★ 带连字符的 36 字符标准 UUID，不是 32 位无连字符随机串。
+        var phoneUUID: String = "45f68d78-cd77-4c1a-a8cd-080249272b48"
+        var phoneBrand: String = "Xiaomi"
+        var phoneModel: String = "2206122SC"
+        var phoneOs: String = "Android"
+        /// logcat: phoneOsVersion: 35（Build.VERSION.SDK_INT 的字符串）
+        var phoneOsVersion: String = "35"
+        var packageName: String = "net.easyconn.carman.easyride"
+        /// logcat: versionCode: 37
+        var versionCode: Int = 37
+        /// logcat: speechEngine：IFY_FREE, engine = 2
+        var speechEngineType: Int = 2
+        var sn: String = "ehCs"
+        var modelId: String = "44001"
+        var wifiMac: String = "4B:F8:5F:0A:B2:E3"
+        var action: Int = 128
     }
 
     // MARK: - 采集参数
@@ -171,87 +210,84 @@ final class CarbitLinkWire {
         try Self.mirrorFrame(code: MirrorCode.videoFrame.rawValue, payload: annexB)
     }
 
-    /// 【v0.8】主动上报用的「合并字段集」CLIENT_INFO（兜底路径）。
+    /// 【v0.9】主动上报的「合并字段集」CLIENT_INFO。
+    /// 身份字段全部照搬原厂 App（准入层校验 channel + phoneUUID），
     /// 同时覆盖三套静态证据，避免再靠猜：
     ///   A. native C2PMainService::handleClientInfo(@0x1bebec) 解析侧 18 字段
     ///   B. Java ECP_C2P_CLIENT_INFO.u0(Map) 发送侧字段（pxcVersion/pubkey/...）
     ///   C. 二维码解出的本车参数（modelid / sn / bm / action）
     /// token 是【整数 0】（u0() 里 JSONObject.put("token", 0)），不是空串。
     static func clientInfoJSON(
-        huid: String, huName: String, flavor: Int, channel: Int,
-        sdkVersion: String, phoneOsVersion: String, phoneModel: String,
-        phoneUUID: String, pubkey: String, encryptedHUID: String,
-        sn: String, modelId: String, wifiMac: String, qrAction: Int
+        identity: ClientIdentity, pubkey: String, encryptedHUID: String
     ) -> Data {
         let object: [String: Any] = [
-            // A. native 解析侧
-            "sdkVersion": sdkVersion,
-            "flavor": flavor,
-            "channel": channel,
-            "HUID": huid,
-            "HUName": huName,
+            // A. native 解析侧（原厂身份，非 iOS 自称）
+            "sdkVersion": identity.sdkVersion,
+            "flavor": identity.flavor,
+            "channel": identity.channel,
+            "HUID": identity.huid,
+            "HUName": identity.huName,
             "encryptedHUID": encryptedHUID,
             "token": 0,
-            "supportFunction": qrAction,
+            "supportFunction": identity.action,
             "productType": 0,
             "supportMic": false,
-            "package_name": "net.easyconn.carman.easyride",
+            "package_name": identity.packageName,
             "screenType": 1,
             "wakeupWord": "",
             "supportBackDesktop": false,
-            "phoneOs": "iOS",
-            "phoneOsVersion": phoneOsVersion,
-            "phoneModel": phoneModel,
-            "phoneBrand": "Apple",
+            "phoneOs": identity.phoneOs,
+            "phoneOsVersion": identity.phoneOsVersion,
+            "phoneModel": identity.phoneModel,
+            "phoneBrand": identity.phoneBrand,
             // B. u0() 发送侧
-            "pxcVersion": "1.0.2",
-            "phoneUUID": phoneUUID,
-            "package": "net.easyconn.carman.easyride",
-            "versionCode": 1,
+            "pxcVersion": identity.pxcVersion,
+            "phoneUUID": identity.phoneUUID,
+            "package": identity.packageName,
+            "versionCode": identity.versionCode,
             "pubkey": pubkey,
             "bluetoothName": "",
             "supportH264IFrame": true,
             "appVersionFingerPrint": "",
-            "speechEngineType": 0,
+            "speechEngineType": identity.speechEngineType,
             // C. 二维码真实参数（本车：modelid=44001 sn=ehCs action=128）
-            "modelid": modelId,
-            "sn": sn,
-            "bm": wifiMac,
-            "action": qrAction
+            "modelid": identity.modelId,
+            "sn": identity.sn,
+            "bm": identity.wifiMac,
+            "action": identity.action
         ]
         return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
     }
 
-    /// 【v0.8】被动应答 `0x00010011`：严格按 ECP_C2P_CLIENT_INFO.u0(Map) 构造。
+    /// 【v0.9】被动应答 `0x00010011`：严格按 ECP_C2P_CLIENT_INFO.u0(Map) 构造。
     /// `carHUID` 必须用【车机在 0x00010010 里下发的 HUID】——车机拿 pubkey 还原
     /// encryptedHUID 后要和这个自己发的值比对，填错必被拒。
     static func clientInfoReplyJSON(
-        carHUID: String, pubkey: String, encryptedHUID: String,
-        phoneUUID: String, phoneOsVersion: String, phoneModel: String,
-        supportFunction: Int
+        identity: ClientIdentity, carHUID: String,
+        pubkey: String, encryptedHUID: String
     ) -> Data {
         let object: [String: Any] = [
-            "pxcVersion": "1.0.2",
-            "phoneUUID": phoneUUID,
-            "phoneBrand": "Apple",
-            "phoneModel": phoneModel,
-            "phoneOsVersion": phoneOsVersion,
-            "phoneOs": "iOS",
-            "package": "net.easyconn.carman.easyride",
-            "versionCode": 1,
+            "pxcVersion": identity.pxcVersion,
+            "phoneUUID": identity.phoneUUID,
+            "phoneBrand": identity.phoneBrand,
+            "phoneModel": identity.phoneModel,
+            "phoneOsVersion": identity.phoneOsVersion,
+            "phoneOs": identity.phoneOs,
+            "package": identity.packageName,
+            "versionCode": identity.versionCode,
             "token": 0,
             "pubkey": pubkey,
             "encryptedHUID": encryptedHUID,
             "bluetoothName": "",
             "supportH264IFrame": true,
-            "supportFunction": supportFunction,
+            "supportFunction": identity.action,
             "appVersionFingerPrint": "",
-            "speechEngineType": 0,
+            "speechEngineType": identity.speechEngineType,
             // 回显车机身份，供 native handleClientInfo 侧校验
             "HUID": carHUID,
-            "sdkVersion": "5.1.1",
-            "flavor": 50,
-            "channel": 9975
+            "sdkVersion": identity.sdkVersion,
+            "flavor": identity.flavor,
+            "channel": identity.channel
         ]
         return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
     }
@@ -329,13 +365,13 @@ final class CarbitLinkWire {
     }
 
     /// 低 16 位操作码 → 事件。
-    /// 注意 0x0011 不是采集参数：实车验证它是 0x10 的「状态回复」形态，
-    /// 载荷是 JSON（v0.5 实测收到 {"status": false}），归入 unknown 让上层打文本。
+    /// 注意 0x0011 不是采集参数：实车验证它是通用状态帧（准入层 NACK），
+    /// 载荷是 JSON（{\n\t"status":\tfalse\n}），归入 unknown 让上层打文本。
     private static func classify(low16: UInt16, fullCode: UInt32, payload: Data, framing: Framing, version: UInt32) -> [Event] {
         switch low16 {
         case 0x0010:
-            // 【v0.8】0x00010010 是车机 CLIENT_INFO 请求，载荷是 JSON，
-            // 绝不能先喂给 protobuf 解码器（曾有被误判成采集参数的风险）。
+            // 0x00010010 是车机 CLIENT_INFO 请求，载荷是 JSON，
+            // 绝不能先喂给 protobuf 解码器。
             if payload.first == UInt8(ascii: "{") {
                 return [.unknown(code: fullCode, payload: payload, framing: framing)]
             }
@@ -343,8 +379,7 @@ final class CarbitLinkWire {
             if let cfg { return [.start(cfg)] }
             return [.start(nil)]
         case 0x0011:
-            // 0x70000011 = ClientInfoRly/status。实车载荷 {\n\t"status":\tfalse\n}
-            // 是车机端授权层拒绝，绝不是启动指令。归入 unknown 让上层打 JSON 文本。
+            // 0x70000011 = PXC 准入层通用状态帧（不是 handleClientInfo 的应答）。
             return [.unknown(code: fullCode, payload: payload, framing: framing)]
         case MirrorCode.ready.rawValue:
             return [.ready]
