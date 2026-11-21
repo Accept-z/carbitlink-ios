@@ -31,10 +31,12 @@ jobs:
           echo "HEAD = $(git rev-parse HEAD)"
           echo "CarbitLinkOutput.swift md5 = $(md5 -q App/CarbitLinkOutput.swift)"
           echo "CarbitLinkIdentity.swift md5 = $(md5 -q App/CarbitLinkIdentity.swift)"
-          echo "[v0.8] rsaSignatureRaw = $(grep -c 'rsaSignatureRaw' App/CarbitLinkIdentity.swift || true)"
-          echo "[v0.8] carClientInfoReply = $(grep -c 'carClientInfoReply' App/CarbitLinkWire.swift || true)"
-          echo "[v0.8] 静默等待首帧 = $(grep -c '先静默等待车机首帧' App/CarbitLinkOutput.swift || true)"
-          echo "[v0.8] sn=ehCs = $(grep -c '"ehCs"' App/CarbitLinkOutput.swift || true)"
+          echo "[v0.9] rsaSignatureRaw = $(grep -c 'rsaSignatureRaw' App/CarbitLinkIdentity.swift || true)"
+          echo "[v0.9] ClientIdentity = $(grep -c 'struct ClientIdentity' App/CarbitLinkWire.swift || true)"
+          echo "[v0.9] channel=44001 = $(grep -c 'var channel: Int = 44001' App/CarbitLinkWire.swift || true)"
+          echo "[v0.9] 原厂 phoneUUID = $(grep -c '45f68d78-cd77-4c1a-a8cd-080249272b48' App/CarbitLinkWire.swift || true)"
+          echo "[v0.9] 立即上报 CLIENT_INFO = $(grep -c 'v0.9 立即上报 CLIENT_INFO' App/CarbitLinkOutput.swift || true)"
+          echo "[v0.9] 新签名 clientInfoJSON = $(grep -c 'identity: ClientIdentity, pubkey' App/CarbitLinkWire.swift || true)"
           echo "allowLocalEndpointReuse = $(grep -c 'allowLocalEndpointReuse' App/CarbitLinkOutput.swift || true)"
 
       - name: 环境信息
