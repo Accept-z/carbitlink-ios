@@ -4,13 +4,15 @@ on:
   workflow_dispatch:
 
 jobs:
-  linux:
-    runs-on: ubuntu-latest
+  labels:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15, macos-26, macos-13]
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: hello
-        run: echo linux-ok && uname -a
-  mac:
-    runs-on: macos-14
-    steps:
-      - name: hello
-        run: echo mac-ok && xcodebuild -version
+      - name: info
+        run: |
+          echo "runner=${{ matrix.runner }}"
+          sw_vers
+          xcodebuild -version || true
