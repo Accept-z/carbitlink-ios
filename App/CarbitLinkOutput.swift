@@ -37,7 +37,9 @@ final class CarbitLinkOutput {
         /// 万一仪表是客户端角色，就在这两个口上等我们。
         var controlPorts: [UInt16] = [10930, 10921, 10920]
         /// 视频通道候选端口。
-        var dataPorts: [UInt16] = [10920, 10922]
+        /// 10921 是实车补上的：控制连上 10930 后 10920/10922 都拒连，而 Android 抓包里
+        /// 10921 与控制流始终成对出现，很可能就是视频口。
+        var dataPorts: [UInt16] = [10920, 10921, 10922]
         /// 采集参数，运行时被仪表下发值覆盖；这里是本车实测默认值。
         var width: Int = 1152
         var height: Int = 640
@@ -74,6 +76,8 @@ final class CarbitLinkOutput {
     private var pendingFrame: Data?
     private var frameInFlight = false
     private var dumpHandle: FileHandle?
+    /// mDNS 浏览器：从 `_EasyConn._tcp` 的 TXT 记录里取仪表真实的 huid 与端口。
+    private var browser: NWBrowser?
     /// 上一次上报给 UI 的连接状态。只在真实跃变时回调，
     /// 避免 stop() 每次都报一次"已断开"（日志里会和 Receiver stopped 成对出现，纯噪声）。
     private var reportedConnected = false
@@ -107,11 +111,17 @@ final class CarbitLinkOutput {
         }
         isRunning = true
         log("开始连接仪表 \(config.host)，控制端口候选 \(portList(config.controlPorts))")
-        connectControlResetting()
+        // 先开 mDNS 窗口再看连：仪表的 huid 只在 TXT 里，握手空着等于没报名。
+        startDiscoveryLocked()
+        queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.isRunning, self.control == nil else { return }
+            self.connectControlResetting()
+        }
     }
 
     private func stopLocked() {
         isRunning = false
+        browser?.cancel(); browser = nil
         control?.cancel(); control = nil
         data?.cancel(); data = nil
         parsers.removeAll()
@@ -355,6 +365,67 @@ final class CarbitLinkOutput {
         return created
     }
 
+    // MARK: - mDNS 发现
+    //
+    // 实车暴露的问题：握手发出去是 {"HUName":"","HUID":""}，两个字段都空。
+    // HUID 是仪表的 MAC，iOS 拿不到 Wi-Fi MAC，但仪表自己在 `_EasyConn._tcp`
+    // 的 TXT 里报了 huid / port / flavor / channel —— 这是唯一可靠来源。
+
+    private func startDiscoveryLocked() {
+        browser?.cancel(); browser = nil
+        let parameters = NWParameters.tcp
+        parameters.includePeerToPeer = true
+        let browser = NWBrowser(for: .bonjour(type: "_EasyConn._tcp", domain: nil), using: parameters)
+        browser.stateUpdateHandler = { [weak self] state in
+            if case let .failed(error) = state {
+                self?.log("mDNS 浏览失败：\(error.localizedDescription)")
+            }
+        }
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self else { return }
+            for result in results {
+                var detail = ""
+                if case let .bonjour(txtData) = result.metadata, let txtData {
+                    let records = Self.parseTXTData(txtData)
+                    let info = CarbitLinkWire.parseTXT(records)
+                    detail = " TXT{huid=\(info.huid) port=\(info.port) flavor=\(info.flavor) channel=\(info.channel)}"
+                    if !info.huid.isEmpty, self.config.huid.isEmpty {
+                        self.config.huid = info.huid
+                        self.log("mDNS 取到 huid=\(info.huid)（\(CarbitLinkWire.formatHUID(info.huid))），握手将带上")
+                    }
+                }
+                self.log("mDNS 发现服务 \(result.endpoint)\(detail)")
+                // 服务实例名一般就是仪表的 HUName（对照 Android 抓包里的 "ufCX"）。
+                if case let .service(name, _, _) = result.endpoint, self.config.huName.isEmpty, !name.isEmpty {
+                    self.config.huName = name
+                    self.log("mDNS 取到 HUName=\(name)")
+                }
+            }
+        }
+        browser.start(queue: queue)
+        self.browser = browser
+    }
+
+    /// 解析 DNS-SD 的 TXT 负载（每项是「1 字节长度 + key=value」）。
+    private static func parseTXTData(_ data: Data) -> [String: String] {
+        var records: [String: String] = [:]
+        let bytes = [UInt8](data)
+        var index = 0
+        while index < bytes.count {
+            let length = Int(bytes[index])
+            index += 1
+            guard length > 0, index + length <= bytes.count else { break }
+            let entry = String(decoding: bytes[index ..< index + length], as: UTF8.self)
+            index += length
+            if let separator = entry.firstIndex(of: "=") {
+                records[String(entry[entry.startIndex ..< separator])] = String(entry[entry.index(after: separator)...])
+            } else {
+                records[entry] = ""
+            }
+        }
+        return records
+    }
+
     // MARK: - 工具
 
     private static func isConnectionRefused(_ error: NWError) -> Bool {
@@ -476,8 +547,7 @@ final class CarbitLinkOutput {
     }
 
     /// 状态只在真实跃变时上报，避免 stop() 制造假的"已断开"。
-    private func setConnected(_ connected: Bool) {
-        guard connected != reportedConnected else { return }
+    private func setConnected(_ connected: Bool) {        guard connected != reportedConnected else { return }
         reportedConnected = connected
         onStateChange?(connected)
     }
