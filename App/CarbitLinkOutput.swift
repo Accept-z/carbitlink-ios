@@ -385,8 +385,8 @@ final class CarbitLinkOutput {
             guard let self else { return }
             for result in results {
                 var detail = ""
-                if case let .bonjour(txtData) = result.metadata, let txtData {
-                    let records = Self.parseTXTData(txtData)
+                if case let .bonjour(txtRecord) = result.metadata, let txtRecord {
+                    let records = txtRecord.dictionary
                     let info = CarbitLinkWire.parseTXT(records)
                     detail = " TXT{huid=\(info.huid) port=\(info.port) flavor=\(info.flavor) channel=\(info.channel)}"
                     if !info.huid.isEmpty, self.config.huid.isEmpty {
@@ -404,26 +404,6 @@ final class CarbitLinkOutput {
         }
         browser.start(queue: queue)
         self.browser = browser
-    }
-
-    /// 解析 DNS-SD 的 TXT 负载（每项是「1 字节长度 + key=value」）。
-    private static func parseTXTData(_ data: Data) -> [String: String] {
-        var records: [String: String] = [:]
-        let bytes = [UInt8](data)
-        var index = 0
-        while index < bytes.count {
-            let length = Int(bytes[index])
-            index += 1
-            guard length > 0, index + length <= bytes.count else { break }
-            let entry = String(decoding: bytes[index ..< index + length], as: UTF8.self)
-            index += length
-            if let separator = entry.firstIndex(of: "=") {
-                records[String(entry[entry.startIndex ..< separator])] = String(entry[entry.index(after: separator)...])
-            } else {
-                records[entry] = ""
-            }
-        }
-        return records
     }
 
     // MARK: - 工具
