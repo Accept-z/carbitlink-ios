@@ -1,8 +1,16 @@
 name: probe
 
-on:/n  workflow_dispatch:/n/njobs:/n  linux:/n    runs-on: ubuntu-latest
-    steps:/n      - name: hello
+on:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: hello
         run: echo linux-ok && uname -a
-  mac:/n    runs-on: macos-14
-    steps:/n      - name: hello
+  mac:
+    runs-on: macos-14
+    steps:
+      - name: hello
         run: echo mac-ok && xcodebuild -version
