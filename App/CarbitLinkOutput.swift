@@ -235,7 +235,7 @@ final class CarbitLinkOutput {
         // 3) 视频通道
         connectDataResetting()
 
-        receive(on: control, tag: "ctl")
+        if let connection = control { receive(on: connection, tag: "ctl") }
     }
 
     private func receive(on connection: NWConnection, tag: String) {
