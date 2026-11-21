@@ -49,6 +49,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private let carbitLink = CarbitLinkOutput()
     private let carbitLinkSwitch = UISwitch()
     private let carbitHostField = UITextField()
+    /// 亿连开关下方的现场提示：当前 Wi-Fi / 本机 IP / 推算网关。
+    /// 连错网络（比如还挂在自家路由器上）时，这里一眼就能看出来。
+    private let carbitStatus = UILabel()
+    private var currentSSID: String?
     private let fullscreenButton = UIButton(type: .system)
     private let forgetPasswordButton = UIButton(type: .system)
     private let passwordStatus = UILabel()
@@ -164,9 +168,15 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         let dumpRow = UIStackView(arrangedSubviews: [dumpExport, dumpClear]); dumpRow.spacing = 16
         let diagButton = UIButton(type: .system); diagButton.setTitle("网络诊断（查仪表 IP 与端口）", for: .normal)
         diagButton.addTarget(self, action: #selector(runNetworkDiagnostics), for: .touchUpInside)
-        let carbitBox = UIStackView(arrangedSubviews: [carbitRow, carbitHostField, carbitNote, dumpRow, diagButton])
+        carbitStatus.font = .preferredFont(forTextStyle: .caption1)
+        carbitStatus.textColor = .secondaryLabel
+        carbitStatus.numberOfLines = 0
+        carbitStatus.text = "当前 Wi-Fi：读取中…"
+        carbitLinkSwitch.addTarget(self, action: #selector(carbitSwitchToggled), for: .valueChanged)
+        let carbitBox = UIStackView(arrangedSubviews: [carbitRow, carbitStatus, carbitHostField, carbitNote, dumpRow, diagButton])
         carbitBox.axis = .vertical; carbitBox.spacing = 8
         settingsStack.addArrangedSubview(carbitBox)
+        refreshCarbitStatus()
         contentStack = stack
         orientationControl.selectedSegmentIndex = UserDefaults.standard.bool(forKey: "portraitDisplay") ? 1 : 0
         orientationControl.addTarget(self, action: #selector(orientationChanged), for: .valueChanged)
@@ -561,6 +571,11 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         UserDefaults.standard.set(carbitLinkSwitch.isOn, forKey: "carbitLinkEnabled")
         var host = (carbitHostField.text ?? "").trimmingCharacters(in: .whitespaces)
         guard carbitLinkSwitch.isOn else { return }
+        // 实车教训：手机上如果还挂着家用网络，按网段推出来的网关会指向家用路由器，
+        // 白跑一轮还以为是仪表不响应。这里先把话说明白。
+        if let ssid = currentSSID, !ssid.lowercased().hasPrefix("kt_ap") {
+            log("⚠️ 当前 Wi-Fi 是「\(ssid)」，不是仪表热点（kt_ap_xxxx）。推算网关很可能是家用路由器，建议先切到仪表热点。")
+        }
         // 没填就从本机 Wi-Fi 地址推网关（192.168.49.2 → 192.168.49.1），少一步手填也少一处手误。
         if host.isEmpty, let guess = CarbitLinkOutput.suggestedGateway() {
             host = guess
@@ -600,8 +615,38 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         log("dump 已清空，下次启动会重新写入表头")
     }
 
+    // MARK: - 亿连现场提示
+
+    @objc private func carbitSwitchToggled() {
+        refreshCarbitStatus()
+    }
+
+    /// 把「连的是哪个 Wi-Fi、本机 IP、推算网关」摆在亿连开关下面。
+    /// 教训来自实车：IP 留空时按网段推网关，结果推到了自家路由器（192.168.1.1），
+    /// 白跑一轮。连错网络必须一眼可见。
+    private func refreshCarbitStatus() {
+        let ip = ReceiverConfiguration.localIPv4Addresses().first ?? "无"
+        let gateway = CarbitLinkOutput.suggestedGateway() ?? "无"
+        let ssid = currentSSID ?? "读取中…"
+        let onMeter = (currentSSID ?? "").lowercased().hasPrefix("kt_ap")
+        let hint = onMeter ? "✔ 已连仪表热点" : "⚠️ 未连仪表热点（kt_ap_xxxx）"
+        carbitStatus.text = "当前 Wi-Fi：\(ssid)  \(hint)\n本机 \(ip) ｜ 推算网关 \(gateway)"
+
+        NEHotspotNetwork.fetchCurrent { [weak self] network in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.currentSSID = network?.ssid
+                let freshSSID = network?.ssid ?? "未知（请在设置里允许定位权限）"
+                let freshIP = ReceiverConfiguration.localIPv4Addresses().first ?? "无"
+                let freshGateway = CarbitLinkOutput.suggestedGateway() ?? "无"
+                let matched = (network?.ssid ?? "").lowercased().hasPrefix("kt_ap")
+                let freshHint = matched ? "✔ 已连仪表热点" : "⚠️ 未连仪表热点（kt_ap_xxxx）"
+                self.carbitStatus.text = "当前 Wi-Fi：\(freshSSID)  \(freshHint)\n本机 \(freshIP) ｜ 推算网关 \(freshGateway)"
+            }
+        }
+    }
+
     // MARK: - 网络诊断
-    //
     // 亿连车机（kt_ap_xxxx）自己就是热点，iPhone 连进去后由它的 DHCP 发地址，
     // 所以「仪表 IP = 本机网段的网关」几乎总是成立。这里把网卡、SSID、网关、
     // 以及 10930/10921/10920/10922 的探测结果一次性摊开，省得靠猜。
@@ -746,6 +791,12 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     @objc private func backgrounded() { if running { stop() }; receiverBrowser.stop() }
     @objc private func copyLog() { UIPasteboard.general.string = lines.joined(separator: "\n") }
     private func log(_ message: String) {
+        // 亿连输出在自己的后台队列里回调 onLog，直接改 lines / logView 会让 UIKit
+        // 在非主线程被访问 —— 一点 Start 就闪退的真凶。这里统一兜到主线程。
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.log(message) }
+            return
+        }
         let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         lines.append("\(timestamp)  \(message)"); if lines.count > 200 { lines.removeFirst(lines.count - 200) }
         if diagnosticsStack != nil, !diagnosticsStack.isHidden, settingsVisible { logView.text = lines.joined(separator: "\n") }
