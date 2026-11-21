@@ -60,6 +60,7 @@
 		FD04C6B75D83204140C4DEEA /* App/DirectAccessoryTransport.m in Sources */ = {isa = PBXBuildFile; fileRef = 43A08A842E89C864862B3AB0 /* App/DirectAccessoryTransport.m */; };
 		C7A1B2D3E4F50617283940B1 /* App/CarbitLinkWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7A1B2D3E4F50617283940A1 /* App/CarbitLinkWire.swift */; };
 		C7A1B2D3E4F50617283940B2 /* App/CarbitLinkOutput.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7A1B2D3E4F50617283940A2 /* App/CarbitLinkOutput.swift */; };
+		C7A1B2D3E4F50617283940B3 /* App/CarbitLinkIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7A1B2D3E4F50617283940A3 /* App/CarbitLinkIdentity.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -117,6 +118,7 @@
 		FEB6265A3FB950679A3B4841 /* Sources/CTDSCarKitCrypto/TDSCarKitCrypto.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = Sources/CTDSCarKitCrypto/TDSCarKitCrypto.c; sourceTree = "<group>"; };
 		C7A1B2D3E4F50617283940A1 /* App/CarbitLinkWire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/CarbitLinkWire.swift; sourceTree = "<group>"; };
 		C7A1B2D3E4F50617283940A2 /* App/CarbitLinkOutput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/CarbitLinkOutput.swift; sourceTree = "<group>"; };
+		C7A1B2D3E4F50617283940A3 /* App/CarbitLinkIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/CarbitLinkIdentity.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -142,6 +144,7 @@
 				16E2A38BC8A7D4D0FB884AB6 /* App/CarPlayMediaSession.swift */,
 				C7A1B2D3E4F50617283940A1 /* App/CarbitLinkWire.swift */,
 				C7A1B2D3E4F50617283940A2 /* App/CarbitLinkOutput.swift */,
+				C7A1B2D3E4F50617283940A3 /* App/CarbitLinkIdentity.swift */,
 				43A08A842E89C864862B3AB0 /* App/DirectAccessoryTransport.m */,
 				59DB484630DAD05A9DD9EA6F /* App/H264Surface.swift */,
 				07F56AF5C64640432F486F25 /* App/MediaSockets.swift */,
@@ -269,6 +272,7 @@
 				D3B8F6FD49FB4AC811675FEB /* App/CarPlayMediaSession.swift in Sources */,
 				C7A1B2D3E4F50617283940B1 /* App/CarbitLinkWire.swift in Sources */,
 				C7A1B2D3E4F50617283940B2 /* App/CarbitLinkOutput.swift in Sources */,
+				C7A1B2D3E4F50617283940B3 /* App/CarbitLinkIdentity.swift in Sources */,
 				FD04C6B75D83204140C4DEEA /* App/DirectAccessoryTransport.m in Sources */,
 				0EC86F455714F97754ED72C4 /* App/H264Surface.swift in Sources */,
 				131430C6B0DCC43DDBA29FCD /* App/MediaSockets.swift in Sources */,
