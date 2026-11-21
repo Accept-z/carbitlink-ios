@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // CarbitLinkOutput.swift
-// 把 CarPlay 帧直接推给亿连（CarbitLink）仪表 —— tds-car-kit / CarWithin 的输出插件。
+// 亿连（CarbitLink）仪表输出 —— v0.4，按 libEPSDK.so 反汇编结论重写。
 //
-// 【拓扑差异，必须注意】
-// Android 端：手机是 Wi-Fi Direct GO，手机**监听** 10920/10921/10922，仪表连进来。
-// iOS 端：没有 Wi-Fi Direct API，只能让手机加入仪表热点，方向反过来 —— 我们主动连。
-// 但「instrument 到底在哪个端口等我们」没有实测定论（Android 抓包里 10930 从未被连接，
-// 因为那时手机是 GO 用不上它）。所以本版不赌单个端口，按候选表依次试，并在日志里
-// 明确记录哪一个连上了 —— 这份日志本身就是下一次迭代的依据。
+// 【拓扑（已由反汇编 + 实车双重确认）】
+//   · iPhone 连仪表热点 kt_ap_xxxx（仪表即网关，实测 192.168.1.1）。
+//   · 控制通道：手机主动连 仪表:10930，PXC 16 字节帧头。
+//   · 镜像通道：仪表主动连回手机（Android 抓包：手机 GO 192.168.49.1 监听
+//     10920/10921/10922，仪表连入；实车：仪表的 10920/10922 拒绝外连）。
+//     所以 iOS 端必须在 10920/10921/10922 上【监听】而不是拨出。
 //
-// 【本版能力边界（v0.2）】
-//   · 能：连接仪表、发握手、请求开始镜像、解析仪表下发的采集参数、
-//         按 0x0072 拉帧节奏推帧、把全部线上字节**分通道**转储到文件。
-//   · 不保证出画面：仪表对「手机推帧」的响应指令码尚未实测确认（见 Code.videoFrame）。
+// 【会话流程（按反汇编指令表）】
+//   1. 连上 10930 → 发 CheckCarUUID(0x000103B0, JSON{HUID,HUName})
+//   2. 发 请求开始镜像(0x00010010, protobuf 采集参数)
+//   3. 仪表应答（0x000103B1 / 采集参数 0x0011…，全部按 dump 落盘）
+//   4. 仪表连入镜像通道 → 0x0072 拉帧，我们按 0x0071 推 H.264（TODO probe）
 //
-// v0.2 修的两个坑：
-//   1) 控制/视频两条 TCP 原先共用同一个 CarbitLinkWire 实例，两条流的半包会拼进
-//      一个缓冲区，字节序必然错乱 —— 改为每条连接独立解析器。
-//   2) 原先只试 10930 → 10921 两级，且把 NWConnection 的 .waiting 一律当失败
-//      （连接被拒和「网络暂时不可用」都会走 .waiting）—— 改为枚举候选端口 +
-//      只在 ECONNREFUSED 时立即换端口，其余情况等 8 秒兜底。
 
 import Foundation
 import Network
@@ -30,21 +25,18 @@ final class CarbitLinkOutput {
     // MARK: - 配置
 
     struct Configuration {
-        /// 仪表 IP。iOS 加入其热点后一般是网关地址，例如 192.168.49.1。
+        /// 仪表 IP。连上仪表热点后一般是网关地址（实车 192.168.1.1）。
         var host: String = ""
-        /// 控制通道候选端口，按顺序尝试。
-        /// 10930 = 仪表 mDNS 广播的那个口；10921/10920 = Android 端手机侧监听的端口，
-        /// 万一仪表是客户端角色，就在这两个口上等我们。
-        var controlPorts: [UInt16] = [10930, 10921, 10920]
-        /// 视频通道候选端口。
-        /// 10921 是实车补上的：控制连上 10930 后 10920/10922 都拒连，而 Android 抓包里
-        /// 10921 与控制流始终成对出现，很可能就是视频口。
-        var dataPorts: [UInt16] = [10920, 10921, 10922]
-        /// 采集参数，运行时被仪表下发值覆盖；这里是本车实测默认值。
+        /// PXC 控制通道端口（仪表监听，实测）。
+        var controlPort: UInt16 = 10930
+        /// 镜像通道端口（我方监听，仪表连入）。
+        var listenPorts: [UInt16] = [10920, 10921, 10922]
+        /// 采集参数：请求开始镜像时上报，运行时被仪表下发值覆盖。
         var width: Int = 1152
         var height: Int = 640
+        var wantFps: Int = 0
         var bitRate: Int = 3_145_728
-        /// 仪表 huid（mDNS 给的仪表 MAC 十六进制），用于握手。
+        /// 仪表 huid（仪表 MAC 十二位十六进制大写），用于身份校验。
         var huid: String = ""
         var huName: String = ""
         /// 把收发的每个字节都记进 dump 文件，便于离线分析未知指令码。
@@ -64,20 +56,21 @@ final class CarbitLinkOutput {
 
     private var config = Configuration()
     private var control: NWConnection?
-    private var data: NWConnection?
-    /// 每条连接一个解析器：两条 TCP 流的半包绝不能混进同一个缓冲区。
+    /// 镜像通道的入站连接（仪表连入），可能有多条。
+    private var mirrors: [ObjectIdentifier: NWConnection] = [:]
+    /// 镜像通道监听器。
+    private var listeners: [UInt16: NWListener] = [:]
+    /// 每条连接一个解析器：不同通道帧头不同，半包也绝不能混。
     private var parsers: [ObjectIdentifier: CarbitLinkWire] = [:]
     private let queue = DispatchQueue(label: "carbitlink.output")
     private var isRunning = false
     private var controlReady = false
-    private var controlIndex = 0
-    private var dataIndex = 0
     /// 待发送的帧。拉模式下仪表每要一帧才推一次，只保留最新一帧。
     private var pendingFrame: Data?
     private var frameInFlight = false
     private var dumpHandle: FileHandle?
-    /// 上一次上报给 UI 的连接状态。只在真实跃变时回调，
-    /// 避免 stop() 每次都报一次"已断开"（日志里会和 Receiver stopped 成对出现，纯噪声）。
+    private var droppedFrameCount = 0
+    /// 上一次上报给 UI 的连接状态。只在真实跃变时回调。
     private var reportedConnected = false
 
     // MARK: - 对外
@@ -100,7 +93,7 @@ final class CarbitLinkOutput {
         // dump 先开，哪怕 host 是空的也留一条记录，免得用户以为功能没跑。
         openDumpIfNeeded()
         guard !config.host.isEmpty else {
-            log("未填仪表 IP。请先连上仪表热点，再填网关地址（一般 192.168.49.1）。")
+            log("未填仪表 IP。请先连上仪表热点，再填网关地址。")
             if let gw = Self.suggestedGateway() {
                 log("按本机地址推断，网关应该是 \(gw)，可直接填进设置。")
             }
@@ -108,20 +101,23 @@ final class CarbitLinkOutput {
             return
         }
         isRunning = true
-        log("开始连接仪表 \(config.host)，控制端口候选 \(portList(config.controlPorts))")
-        connectControlResetting()
+        log("连接仪表 \(config.host):\(config.controlPort)（PXC 控制通道）")
+        startMirrorListeners()
+        connectControl()
     }
 
     private func stopLocked() {
         isRunning = false
+        for listener in listeners.values { listener.cancel() }
+        listeners.removeAll()
+        for mirror in mirrors.values { mirror.cancel() }
+        mirrors.removeAll()
         control?.cancel(); control = nil
-        data?.cancel(); data = nil
         parsers.removeAll()
         controlReady = false
-        controlIndex = 0
-        dataIndex = 0
         pendingFrame = nil
         frameInFlight = false
+        droppedFrameCount = 0
         if dumpHandle != nil {
             write("=== 会话结束 \(ISO8601DateFormatter().string(from: Date())) ===")
             log("dump 已写入 Documents/carbitlink-dump.log")
@@ -140,99 +136,108 @@ final class CarbitLinkOutput {
         }
     }
 
-    // MARK: - 连接（控制通道）
+    // MARK: - 控制通道（PXC，拨出）
 
-    private func connectControlResetting() {
-        controlIndex = 0
-        controlReady = false
-        tryNextControlPort()
-    }
-
-    private func tryNextControlPort() {
+    private func connectControl() {
         guard isRunning else { return }
-        guard controlIndex < config.controlPorts.count else {
-            log("控制端口全部连不上：\(portList(config.controlPorts))。确认手机已连仪表热点、仪表已进入配对界面。")
-            return
-        }
-        let port = config.controlPorts[controlIndex]
-        controlIndex += 1
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { tryNextControlPort(); return }
-
-        log("尝试控制端口 \(port)")
-        let connection = NWConnection(host: NWEndpoint.Host(config.host), port: nwPort, using: .tcp)
+        guard let port = NWEndpoint.Port(rawValue: config.controlPort) else { return }
+        let connection = NWConnection(host: NWEndpoint.Host(config.host), port: port, using: .tcp)
         control = connection
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, self.control === connection else { return }
             switch state {
             case .ready:
                 self.controlReady = true
-                self.log("控制通道已连上 \(self.config.host):\(port) ★")
+                self.log("控制通道已连上 \(self.config.host):\(self.config.controlPort) ★")
                 self.setConnected(true)
                 self.beginControlSession()
             case .failed(let error):
-                self.log("控制通道 \(port) 失败：\(error.localizedDescription)")
+                self.log("控制通道失败：\(error.localizedDescription)")
                 connection.cancel()
-                self.tryNextControlPort()
             case .waiting(let error):
-                if Self.isConnectionRefused(error) {
-                    self.log("端口 \(port) 未监听，换下一个")
-                    connection.cancel()
-                    self.tryNextControlPort()
-                } else {
-                    self.log("控制通道 \(port) 等待中：\(error.localizedDescription)")
-                }
+                self.log("控制通道等待中：\(error.localizedDescription)")
             default:
                 break
             }
         }
         connection.start(queue: queue)
-        // 兜底：某些网络状态下 NWConnection 既不 ready 也不 failed，别死等。
         queue.asyncAfter(deadline: .now() + 8) { [weak self] in
             guard let self, self.control === connection, !self.controlReady else { return }
-            self.log("端口 \(port) 8 秒未就绪，换下一个")
+            self.log("控制通道 8 秒未就绪")
             connection.cancel()
-            self.tryNextControlPort()
         }
     }
 
-    // MARK: - 连接（视频通道）
+    private func beginControlSession() {
+        // 1) 身份校验：CheckCarUUID(0x000103B0)，负载 JSON。
+        let handshake = CarbitLinkWire.handshakeJSON(huid: config.huid.uppercased(), huName: config.huName)
+        let handshakeText = String(data: handshake, encoding: .utf8) ?? "-"
+        log("发送 CheckCarUUID 0x000103B0：\(handshakeText)")
+        if let frame = try? CarbitLinkWire.pxcFrame(cmd: CarbitLinkWire.PXC.checkCarUUID, payload: handshake) {
+            send(frame, on: control, tag: "ctl")
+        }
 
-    private func connectDataResetting() {
-        dataIndex = 0
-        tryNextDataPort()
+        // 2) 请求开始镜像：0x00010010，负载 = 期望采集参数（protobuf）。
+        var wanted = CarbitLinkWire.CaptureConfig()
+        wanted.width = config.width
+        wanted.height = config.height
+        wanted.bitRate = config.bitRate
+        wanted.wantFps = config.wantFps
+        let payload = CarbitLinkWire.encodeMirrorConfig(wanted)
+        log("发送请求开始镜像 0x00010010（期望 \(config.width)x\(config.height) @\(config.bitRate)bps，protobuf \(payload.count)B）")
+        if let frame = try? CarbitLinkWire.pxcFrame(cmd: CarbitLinkWire.PXC.startMirror, payload: payload) {
+            send(frame, on: control, tag: "ctl")
+        }
+
+        // 3) 开始收仪表的应答。
+        if let connection = control {
+            receive(on: connection, tag: "ctl")
+        }
     }
 
-    private func tryNextDataPort() {
-        guard isRunning else { return }
-        guard dataIndex < config.dataPorts.count else {
-            log("视频端口全部连不上：\(portList(config.dataPorts))")
-            return
-        }
-        let port = config.dataPorts[dataIndex]
-        dataIndex += 1
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { tryNextDataPort(); return }
+    // MARK: - 镜像通道（监听，仪表连入）
 
-        log("尝试视频端口 \(port)")
-        let connection = NWConnection(host: NWEndpoint.Host(config.host), port: nwPort, using: .tcp)
-        data = connection
+    private func startMirrorListeners() {
+        for port in config.listenPorts {
+            guard let nwPort = NWEndpoint.Port(rawValue: port) else { continue }
+            let listener: NWListener
+            do {
+                listener = try NWListener(using: .tcp, on: nwPort)
+            } catch {
+                log("无法监听 \(port)：\(error.localizedDescription)")
+                continue
+            }
+            listener.newConnectionHandler = { [weak self] connection in
+                guard let self, self.isRunning else { connection.cancel(); return }
+                self.log("镜像通道：仪表连入本地端口 \(port) ★")
+                self.acceptMirror(connection, localPort: port)
+            }
+            listener.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                if case .failed(let error) = state {
+                    self.log("监听 \(port) 失败：\(error.localizedDescription)")
+                }
+            }
+            listener.start(queue: queue)
+            listeners[port] = listener
+            log("已在 \(port) 监听，等待仪表连入")
+        }
+    }
+
+    private func acceptMirror(_ connection: NWConnection, localPort: UInt16) {
+        let tag = "mir\(localPort % 100)"
         connection.stateUpdateHandler = { [weak self] state in
-            guard let self, self.data === connection else { return }
+            guard let self else { return }
             switch state {
             case .ready:
-                self.log("视频通道已连上 \(self.config.host):\(port) ★")
-                self.receive(on: connection, tag: "data")
+                self.mirrors[ObjectIdentifier(connection)] = connection
+                self.log("[\(tag)] 镜像通道就绪 ★")
+                self.receive(on: connection, tag: tag)
             case .failed(let error):
-                self.log("视频通道 \(port) 失败：\(error.localizedDescription)")
-                connection.cancel()
-                self.tryNextDataPort()
-            case .waiting(let error):
-                if Self.isConnectionRefused(error) {
-                    self.log("视频端口 \(port) 未监听，换下一个")
-                    connection.cancel()
-                    self.tryNextDataPort()
-                } else {
-                    self.log("视频通道 \(port) 等待中：\(error.localizedDescription)")
-                }
+                self.log("[\(tag)] 镜像连接失败：\(error.localizedDescription)")
+                self.mirrors.removeValue(forKey: ObjectIdentifier(connection))
+            case .cancelled:
+                self.mirrors.removeValue(forKey: ObjectIdentifier(connection))
             default:
                 break
             }
@@ -240,26 +245,7 @@ final class CarbitLinkOutput {
         connection.start(queue: queue)
     }
 
-    // MARK: - 会话
-
-    private func beginControlSession() {
-        // 1) 握手（明文 JSON）。
-        let huid = config.huid.uppercased()
-        let handshake = CarbitLinkWire.handshakeJSON(huid: huid, huName: config.huName)
-        log("握手：\(String(data: handshake, encoding: .utf8) ?? "-")")
-        send(handshake, on: control, tag: "ctl")
-
-        // 2) 请求开始镜像。实测该码发出后，仪表会连视频通道并发 cmd 0x0010。
-        if let request = try? CarbitLinkWire().frame(code: .requestStart) {
-            log("请求开始镜像 0x\(String(format: "%04X", CarbitLinkWire.Code.requestStart.rawValue))")
-            send(request, on: control, tag: "ctl")
-        }
-
-        // 3) 视频通道
-        connectDataResetting()
-
-        if let connection = control { receive(on: connection, tag: "ctl") }
-    }
+    // MARK: - 收包
 
     private func receive(on connection: NWConnection, tag: String) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] chunk, _, isComplete, error in
@@ -268,7 +254,7 @@ final class CarbitLinkOutput {
                 if self.config.dumpsBytes { self.dump(chunk, tag: tag) }
                 let parser = self.parser(for: connection)
                 for event in parser.consume(chunk) {
-                    self.handle(event: event, tag: tag)
+                    self.handle(event: event, on: connection, tag: tag)
                 }
             }
             if let error {
@@ -277,13 +263,14 @@ final class CarbitLinkOutput {
             }
             if isComplete {
                 self.log("[\(tag)] 对端关闭了连接")
+                self.mirrors.removeValue(forKey: ObjectIdentifier(connection))
                 return
             }
             self.receive(on: connection, tag: tag)
         }
     }
 
-    private func handle(event: CarbitLinkWire.Event, tag: String) {
+    private func handle(event: CarbitLinkWire.Event, on connection: NWConnection, tag: String) {
         switch event {
         case .start(let incoming):
             if let incoming {
@@ -294,16 +281,26 @@ final class CarbitLinkOutput {
                 log("[\(tag)] 仪表下发采集参数：\(incoming.width)×\(incoming.height) @ \(incoming.bitRate)bps 编码 \(incoming.encoder) fps=\(incoming.wantFps)\(mode)")
                 onCaptureConfig?(incoming)
             } else {
-                log("[\(tag)] 收到 0x0010 启动指令，载荷未解析出字段（已转储原始字节）")
+                log("[\(tag)] 收到启动指令，载荷未解析出采集字段（已转储原始字节）")
             }
         case .ready:
             log("[\(tag)] 视频通道就绪（0x0070）")
         case .frameRequest:
             pumpFrameIfPossible()
-        case .heartbeat:
-            if let beat = try? CarbitLinkWire().frame(code: .heartbeat) { send(beat, on: control, tag: "ctl") }
-        case .unknown(let code, let payload):
-            log("[\(tag)] 未知指令 0x\(String(format: "%04X", code))，\(payload.count) 字节：\(payload.hexDump(limit: 64))")
+        case .heartbeat(let code, let framing):
+            // 心跳应答码未实测（TODO probe）：先按同一通道原样回显。
+            if framing == .pxc {
+                if let reply = try? CarbitLinkWire.pxcFrame(cmd: code) {
+                    send(reply, on: connection, tag: "\(tag)-hb")
+                }
+            } else {
+                if let reply = try? CarbitLinkWire.mirrorFrame(code: UInt16(code & 0xFFFF)) {
+                    send(reply, on: connection, tag: "\(tag)-hb")
+                }
+            }
+        case .unknown(let code, let payload, let framing):
+            let kind = framing == .pxc ? "PXC" : "镜像"
+            log("[\(tag)] \(kind)指令 0x\(String(format: "%08X", code))，\(payload.count) 字节：\(payload.hexDump(limit: 64))")
         }
     }
 
@@ -312,19 +309,23 @@ final class CarbitLinkOutput {
     private func pumpFrameIfPossible() {
         guard isRunning, !frameInFlight, let frame = pendingFrame else { return }
         pendingFrame = nil
+        // 镜像通道一条都没建立时不能硬发——发到 PXC 控制通道上语义就错了。
+        guard let target = mirrors.values.first else {
+            droppedFrameCount += 1
+            if droppedFrameCount == 1 || droppedFrameCount % 120 == 0 {
+                log("暂无镜像通道，已丢弃 \(droppedFrameCount) 帧（仪表连入 10920/10921/10922 后才会推帧）")
+            }
+            return
+        }
         frameInFlight = true
-        guard let packet = try? CarbitLinkWire().videoFrame(annexB: frame) else {
+        guard let packet = try? CarbitLinkWire.mirrorFrame(code: CarbitLinkWire.MirrorCode.videoFrame.rawValue, payload: frame) else {
             frameInFlight = false
             return
         }
-        if config.dumpsBytes { dump(packet, tag: "data-tx") }
-        // 视频通道没连上时退回控制通道发，避免整条链路静默。
-        let target = data ?? control
-        target?.send(content: packet, completion: .contentProcessed { [weak self] error in
+        if config.dumpsBytes { dump(packet, tag: "mir-tx") }
+        target.send(content: packet, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             self.frameInFlight = false
-            // 换端口/停会话时连接被 cancel 会回 ECANCELED(89)，
-            // 那不是故障，之前会把 dump 刷成几百行噪声。
             if let error, !Self.isCancellation(error) {
                 self.log("推帧失败：\(error.localizedDescription)")
             }
@@ -337,12 +338,18 @@ final class CarbitLinkOutput {
         guard let connection else { return }
         if config.dumpsBytes { dump(payload, tag: "\(tag)-tx") }
         connection.send(content: payload, completion: .contentProcessed { [weak self] error in
-            if let error, !Self.isCancellation(error) { self?.log("[\(tag)] 发送失败：\(error.localizedDescription)") }
+            if let error, !(self?.isCancellationSafe(error) ?? false) {
+                self?.log("[\(tag)] 发送失败：\(error.localizedDescription)")
+            }
         })
     }
 
+    private func isCancellationSafe(_ error: Error) -> Bool {
+        Self.isCancellation(error)
+    }
+
     /// 连接被主动 cancel 时下层会回 ECANCELED，不算错误。
-    private static func isCancellation(_ error: Error) -> Bool {
+    static func isCancellation(_ error: Error) -> Bool {
         guard let nw = error as? NWError, case .posix(let code) = nw else { return false }
         return code == .ECANCELED
     }
@@ -352,12 +359,13 @@ final class CarbitLinkOutput {
     private func parser(for connection: NWConnection) -> CarbitLinkWire {
         let key = ObjectIdentifier(connection)
         if let existing = parsers[key] { return existing }
-        let created = CarbitLinkWire()
+        // 控制通道是 PXC；仪表连入的镜像通道用 8 字节头。
+        let created = connection === control
+            ? CarbitLinkWire(framing: .pxc)
+            : CarbitLinkWire(framing: .mirror)
         parsers[key] = created
         return created
     }
-
-    // MARK: - 工具
 
     private static func isConnectionRefused(_ error: NWError) -> Bool {
         if case .posix(let code) = error, code == .ECONNREFUSED { return true }
@@ -377,8 +385,6 @@ final class CarbitLinkOutput {
     }
 
     /// App 一启动就把文件建出来（带表头）。
-    /// 否则用户可能在"从没连上过"的情况下根本找不到这个文件，
-    /// 误以为是功能没生效。
     @discardableResult
     static func ensureDumpFile() -> URL? {
         guard let url = dumpURL else { return nil }
@@ -392,7 +398,7 @@ final class CarbitLinkOutput {
         let header = """
         === CarbitLink dump ===
         文件：Documents/carbitlink-dump.log
-        说明：亿连输出启动后，这里记录每条 TCP 的收发字节（ctl/data/ctl-tx/data-tx）
+        说明：亿连输出启动后，这里记录每条 TCP 的收发字节（ctl/mirN/…-tx）
               以及文字日志（以 # 开头）。没连上仪表时也会留下尝试记录。
         创建：\(ISO8601DateFormatter().string(from: Date()))
 
@@ -406,10 +412,11 @@ final class CarbitLinkOutput {
         dumpHandle = try? FileHandle(forWritingTo: url)
         dumpHandle?.seekToEndOfFile()
         let ip = Self.localWiFiAddress() ?? "未知"
+        let listenText = portList(config.listenPorts)
         write("")
         write("=== 新会话 \(ISO8601DateFormatter().string(from: Date())) ===")
-        write("# 目标 host=\(config.host)")
-        write("# 控制端口候选=\(portList(config.controlPorts)) 视频端口候选=\(portList(config.dataPorts))")
+        write("# 目标 host=\(config.host):\(config.controlPort)（PXC 控制通道）")
+        write("# 镜像通道监听=\(listenText)（等待仪表连入）")
         write("# 本机 Wi-Fi 地址=\(ip)")
         write("# 采集参数=\(config.width)x\(config.height) @\(config.bitRate)bps huid=\(config.huid.isEmpty ? "-" : config.huid)")
     }
@@ -420,7 +427,6 @@ final class CarbitLinkOutput {
     }
 
     /// 由本机 Wi-Fi 地址推断仪表网关：192.168.49.2 → 192.168.49.1。
-    /// 亿连的车机热点通常就是这个网段的 .1，省得用户手填错。
     static func suggestedGateway() -> String? {
         guard let ip = localWiFiAddress() else { return nil }
         let parts = ip.split(separator: ".")
@@ -439,7 +445,6 @@ final class CarbitLinkOutput {
     }
 
     /// 探测某个 host:port 是否有 TCP 服务在听。
-    /// 语义上只判断「能建连」：.ready = 通，.failed / .waiting（含 ECONNREFUSED、不可达）= 不通。
     static func probe(host: String, port: UInt16, timeout: TimeInterval = 0.9) -> Bool {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return false }
         let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
@@ -478,7 +483,8 @@ final class CarbitLinkOutput {
     }
 
     /// 状态只在真实跃变时上报，避免 stop() 制造假的"已断开"。
-    private func setConnected(_ connected: Bool) {        guard connected != reportedConnected else { return }
+    private func setConnected(_ connected: Bool) {
+        guard connected != reportedConnected else { return }
         reportedConnected = connected
         onStateChange?(connected)
     }
