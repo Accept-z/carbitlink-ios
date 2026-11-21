@@ -20,9 +20,17 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 已被 GitHub 退役（报 "configuration 'macos-14-arm64-us-default' is not supported"），
+    # macos-15 / macos-latest / macos-26 实测可用。
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
 
       - name: 还原鉴权证书（可选）
         env:
