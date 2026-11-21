@@ -172,27 +172,26 @@ final class CarbitLinkOutput {
     }
 
     private func beginControlSession() {
-        // 1) 身份校验：CheckCarUUID(0x000103B0)，负载 JSON。
-        let handshake = CarbitLinkWire.handshakeJSON(huid: config.huid.uppercased(), huName: config.huName)
-        let handshakeText = String(data: handshake, encoding: .utf8) ?? "-"
-        log("发送 CheckCarUUID 0x000103B0：\(handshakeText)")
-        if let frame = try? CarbitLinkWire.pxcFrame(cmd: CarbitLinkWire.PXC.checkCarUUID, payload: handshake) {
+        // P2C 族（手机→仪表）负载是 JSON，不是 protobuf。
+        // 0x00020020 = 设置镜像模式：{"mode":2,"displayRotation":0,"width":W,"height":H}
+        // （反汇编 P2C/c，模式 2 = 整屏直播；字段名直接来自 dex 字符串表）
+        // 此前的 0x000103B0 / 0x00010010 都是 C2P（仪表→手机）方向的指令，方向发反了。
+        let mirrorSetup: [String: Any] = [
+            "mode": 2,
+            "displayRotation": 0,
+            "width": config.width,
+            "height": config.height
+        ]
+        var payload = (try? JSONSerialization.data(withJSONObject: mirrorSetup, options: [.sortedKeys])) ?? Data()
+        let payloadText = String(data: payload, encoding: .utf8) ?? "-"
+        log("发送镜像模式 0x00020020：\(payloadText)")
+        if let frame = try? CarbitLinkWire.pxcFrame(cmd: 0x00020020, payload: payload) {
             send(frame, on: control, tag: "ctl")
         }
 
-        // 2) 请求开始镜像：0x00010010，负载 = 期望采集参数（protobuf）。
-        var wanted = CarbitLinkWire.CaptureConfig()
-        wanted.width = config.width
-        wanted.height = config.height
-        wanted.bitRate = config.bitRate
-        wanted.wantFps = config.wantFps
-        let payload = CarbitLinkWire.encodeMirrorConfig(wanted)
-        log("发送请求开始镜像 0x00010010（期望 \(config.width)x\(config.height) @\(config.bitRate)bps，protobuf \(payload.count)B）")
-        if let frame = try? CarbitLinkWire.pxcFrame(cmd: CarbitLinkWire.PXC.startMirror, payload: payload) {
-            send(frame, on: control, tag: "ctl")
-        }
-
-        // 3) 开始收仪表的应答。
+        // 应答位置预留：仪表若发来开始请求（带 id），在 handle() 里回 0x000201C0
+        // {"isOk":true,"errCode":0,"errMsg":"","id":<对方 id>,"client_set":<参数串>}。
+        // 现在先发模式设置，等仪表的应答（CLIENT_INFO / 开始请求）进 dump。
         if let connection = control {
             receive(on: connection, tag: "ctl")
         }
