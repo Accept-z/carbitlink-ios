@@ -79,9 +79,21 @@ final class CarbitLinkOutput {
     private var reportedConnected = false
 
     // MARK: - 对外
+    //
+    // 所有公开入口都跳进 queue：NWConnection 的回调本来就在 queue 上跑，
+    // 若 start/stop 直接从主线程改 parsers / dumpHandle / pendingFrame，
+    // 就是典型的数据竞争（字典并发读写会直接崩）。
 
     func start(configuration: Configuration) {
-        stop()
+        queue.async { [weak self] in self?.startLocked(configuration) }
+    }
+
+    func stop() {
+        queue.async { [weak self] in self?.stopLocked() }
+    }
+
+    private func startLocked(_ configuration: Configuration) {
+        stopLocked()
         config = configuration
         // dump 先开，哪怕 host 是空的也留一条记录，免得用户以为功能没跑。
         openDumpIfNeeded()
@@ -90,7 +102,7 @@ final class CarbitLinkOutput {
             if let gw = Self.suggestedGateway() {
                 log("按本机地址推断，网关应该是 \(gw)，可直接填进设置。")
             }
-            stop()
+            stopLocked()
             return
         }
         isRunning = true
@@ -98,7 +110,7 @@ final class CarbitLinkOutput {
         connectControlResetting()
     }
 
-    func stop() {
+    private func stopLocked() {
         isRunning = false
         control?.cancel(); control = nil
         data?.cancel(); data = nil
@@ -309,7 +321,9 @@ final class CarbitLinkOutput {
         target?.send(content: packet, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             self.frameInFlight = false
-            if let error {
+            // 换端口/停会话时连接被 cancel 会回 ECANCELED(89)，
+            // 那不是故障，之前会把 dump 刷成几百行噪声。
+            if let error, !Self.isCancellation(error) {
                 self.log("推帧失败：\(error.localizedDescription)")
             }
         })
@@ -321,8 +335,14 @@ final class CarbitLinkOutput {
         guard let connection else { return }
         if config.dumpsBytes { dump(payload, tag: "\(tag)-tx") }
         connection.send(content: payload, completion: .contentProcessed { [weak self] error in
-            if let error { self?.log("[\(tag)] 发送失败：\(error.localizedDescription)") }
+            if let error, !Self.isCancellation(error) { self?.log("[\(tag)] 发送失败：\(error.localizedDescription)") }
         })
+    }
+
+    /// 连接被主动 cancel 时下层会回 ECANCELED，不算错误。
+    private static func isCancellation(_ error: Error) -> Bool {
+        guard let nw = error as? NWError, case .posix(let code) = nw else { return false }
+        return code == .ECANCELED
     }
 
     // MARK: - 解析器
