@@ -1,6 +1,7 @@
 import UIKit
 import NetworkExtension
 import CoreLocation
+import Darwin
 
 final class ReceiverViewController: UIViewController, CLLocationManagerDelegate {
     private let receiver = NativeReceiver()
@@ -161,7 +162,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         let dumpClear = UIButton(type: .system); dumpClear.setTitle("清空 dump", for: .normal)
         dumpClear.addTarget(self, action: #selector(clearDump), for: .touchUpInside)
         let dumpRow = UIStackView(arrangedSubviews: [dumpExport, dumpClear]); dumpRow.spacing = 16
-        let carbitBox = UIStackView(arrangedSubviews: [carbitRow, carbitHostField, carbitNote, dumpRow])
+        let diagButton = UIButton(type: .system); diagButton.setTitle("网络诊断（查仪表 IP 与端口）", for: .normal)
+        diagButton.addTarget(self, action: #selector(runNetworkDiagnostics), for: .touchUpInside)
+        let carbitBox = UIStackView(arrangedSubviews: [carbitRow, carbitHostField, carbitNote, dumpRow, diagButton])
         carbitBox.axis = .vertical; carbitBox.spacing = 8
         settingsStack.addArrangedSubview(carbitBox)
         contentStack = stack
@@ -595,6 +598,88 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         guard let url = CarbitLinkOutput.dumpURL else { return }
         try? "".write(to: url, atomically: true, encoding: .utf8)
         log("dump 已清空，下次启动会重新写入表头")
+    }
+
+    // MARK: - 网络诊断
+    //
+    // 亿连车机（kt_ap_xxxx）自己就是热点，iPhone 连进去后由它的 DHCP 发地址，
+    // 所以「仪表 IP = 本机网段的网关」几乎总是成立。这里把网卡、SSID、网关、
+    // 以及 10930/10921/10920/10922 的探测结果一次性摊开，省得靠猜。
+
+    /// 诊断输出同时进日志和 dump：日志能当场看，dump 能发出来。
+    private func diagLog(_ text: String) {
+        log(text)
+        CarbitLinkOutput.appendDumpLine("# [诊断] \(text)")
+    }
+
+    /// 所有非回环 IPv4 及其网卡名。
+    private static func localInterfaces() -> [(name: String, ip: String)] {
+        var first: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&first) == 0, let head = first else { return [] }
+        defer { freeifaddrs(first) }
+        var result: [(name: String, ip: String)] = []
+        for entry in sequence(first: head, next: { $0.pointee.ifa_next }) {
+            let iface = entry.pointee
+            guard let address = iface.ifa_addr, address.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let flags = iface.ifa_flags
+            guard flags & UInt32(IFF_UP) != 0, flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            result.append((String(cString: iface.ifa_name), String(cString: host)))
+        }
+        return result
+    }
+
+    @objc private func runNetworkDiagnostics() {
+        view.endEditing(true)
+        diagLog("—— 网络诊断开始 ——")
+        let interfaces = Self.localInterfaces()
+        if interfaces.isEmpty { diagLog("没有拿到任何 IPv4 地址（Wi-Fi 可能没连上）") }
+        for item in interfaces { diagLog("网卡 \(item.name) → \(item.ip)") }
+
+        var subnets: [String] = []
+        for item in interfaces {
+            let parts = item.ip.split(separator: ".")
+            guard parts.count == 4 else { continue }
+            let subnet = "\(parts[0]).\(parts[1]).\(parts[2])"
+            if !subnets.contains(subnet) { subnets.append(subnet) }
+        }
+        let subnetText = subnets.isEmpty ? "无" : subnets.joined(separator: " / ")
+        diagLog("网段：\(subnetText)")
+
+        NEHotspotNetwork.fetchCurrent { [weak self] network in
+            DispatchQueue.main.async {
+                let ssid = network?.ssid ?? "未知（需定位权限）"
+                self?.diagLog("当前 Wi-Fi：\(ssid)")
+            }
+        }
+
+        // 网关通常是 .1；192.168.49.108 是 Android 抓包里仪表的地址，同网段时一并试。
+        var targets: [String] = []
+        for subnet in subnets {
+            targets.append("\(subnet).1")
+            targets.append("\(subnet).108")
+        }
+        guard !targets.isEmpty else {
+            diagLog("没有可用网段，跳过端口探测")
+            return
+        }
+        diagLog("开始探测 \(targets.count) 个目标 × 4 端口，单个超时 0.9 秒，请稍等")
+        let ports: [UInt16] = [10930, 10921, 10920, 10922]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            for host in targets {
+                var open: [String] = []
+                for port in ports where CarbitLinkOutput.probe(host: host, port: port) {
+                    open.append("\(port)")
+                }
+                let line = open.isEmpty
+                    ? "\(host) → 4 个端口都无响应"
+                    : "\(host) → 开放 \(open.joined(separator: ",")) ★"
+                DispatchQueue.main.async { self?.diagLog(line) }
+            }
+            DispatchQueue.main.async { self?.diagLog("—— 网络诊断结束 ——") }
+        }
     }
 
     private func stop() {
