@@ -126,7 +126,11 @@ final class CarbitLinkWire {
             let code = buffer.le16(at: 0)
             let length = Int(buffer.le16(at: 2))
             guard length <= Self.maxPayload else {
-                // 长度非法说明字节流已错位，丢弃头部重新同步。
+                // 长度非法说明字节流已错位，或对端帧头布局与我方假设不同。
+                // 早先这里直接丢弃、什么都不留，实车上表现为「连上了但毫无反应」。
+                // 现在把 8 字节原始头部当未知指令抛出去，至少能在日志/dump 里看到。
+                let raw = buffer.prefix(Self.headerSize)
+                events.append(.unknown(code: code, payload: Data(raw)))
                 buffer.removeFirst(Self.headerSize)
                 continue
             }
