@@ -35,12 +35,16 @@ final class CarbitLinkOutput {
     // MARK: - 配置
 
     struct Configuration {
-        /// 仪表 IP。连上仪表热点后一般是网关地址（实车 192.168.1.1）。
+        /// 仪表 IP。保留供「主动连」的旧路径与诊断用；v1.1 默认不再拨出。
         var host: String = ""
-        /// PXC 控制通道端口（仪表监听，实测）。
+        /// 【v1.1】不再主动拨这个端口。10930 只是 mDNS TXT 里的广播值，不是 TCP 口。
         var controlPort: UInt16 = 10930
+        /// 【v1.1】仪表会主动连入的端口。原厂实测：10922 = PXC 控制口
+        /// （`PXCService: accept pxc ... localPort=10922` ×4），10920 = 镜像通道。
+        /// 10921 原厂日志里没出现（v1.0 是我方猜的），先保留监听但标低优先级。
+        var controlListenPort: UInt16 = 10922
         /// 镜像通道端口（我方监听，仪表连入）。
-        var listenPorts: [UInt16] = [10920, 10921, 10922]
+        var listenPorts: [UInt16] = [10920, 10921]
         /// 采集参数：请求开始镜像时上报，运行时被仪表下发值覆盖。
         var width: Int = 1152
         var height: Int = 640
@@ -64,8 +68,9 @@ final class CarbitLinkOutput {
         var modelId: String = "44001"
         var wifiMac: String = "4B:F8:5F:0A:B2:E3"
         var qrAction: Int = 128
-        /// 【v0.9】车机不主动发首帧，此值只用于「立即发送失败后」的兜底重试窗口。
-        var carInfoWaitSeconds: Double = 3.0
+        /// 【v1.1】等仪表下发 CLIENT_INFO 的窗口。原厂实测仪表连上后 ~50ms 就发，
+        /// 给 8 秒足够；超时只记录、不主动发帧（主动发就是 v1.0 那个错误）。
+        var carInfoWaitSeconds: Double = 8.0
         /// 把收发的每个字节都记进 dump 文件，便于离线分析未知指令码。
         var dumpsBytes: Bool = true
     }
@@ -101,11 +106,11 @@ final class CarbitLinkOutput {
     private var reportedConnected = false
     /// 【v0.8】本地 RSA 身份（跨会话复用，见 CarbitLinkIdentity）。
     private var identity: CarbitLinkIdentity?
-    /// 是否已经对车机下发的 CLIENT_INFO 做过应答，避免重复回帧。
-    private var didReplyToCarInfo = false
-    /// 是否已发出兜底的主动 CLIENT_INFO。
-    private var didSendProactiveInfo = false
-    /// 本轮控制通道的代号，用于让「3 秒兜底」在断开/重连后自动失效。
+    /// 【v1.1】是否已按仪表下发的 CLIENT_INFO 做过应答 + 发过手机侧首帧。
+    private var didCompleteHandshake = false
+    /// 【v1.1】控制通道监听器（10922，仪表连入）。
+    private var controlListener: NWListener?
+    /// 本轮控制通道的代号，用于让定时任务在断开/重连后自动失效。
     private var controlGeneration = 0
 
     // MARK: - 对外
@@ -125,8 +130,7 @@ final class CarbitLinkOutput {
     private func startLocked(_ configuration: Configuration) {
         stopLocked()
         config = configuration
-        didReplyToCarInfo = false
-        didSendProactiveInfo = false
+        didCompleteHandshake = false
         controlGeneration += 1
         // dump 先开，哪怕 host 是空的也留一条记录，免得用户以为功能没跑。
         openDumpIfNeeded()
@@ -139,26 +143,27 @@ final class CarbitLinkOutput {
                 log("⚠️ RSA 身份创建失败：\(error.localizedDescription)")
             }
         }
-        guard !config.host.isEmpty else {
-            log("未填仪表 IP。请先连上仪表热点，再填网关地址。")
-            if let gw = Self.suggestedGateway() {
-                log("按本机地址推断，网关应该是 \(gw)，可直接填进设置。")
-            }
-            stopLocked()
-            return
-        }
+        // 【v1.1】不再要求填仪表 IP，也不因为暂时没 Wi-Fi 地址就拒绝启动：
+        // 方向改成「我方监听，仪表连入」。没有地址只提示，监听照开——
+        // 手机可能比仪表热点晚一步拿到 IP，先绑端口不会有坏处。
         isRunning = true
-        log("连接仪表 \(config.host):\(config.controlPort)（PXC 控制通道）")
+        if let ip = Self.localWiFiAddress() {
+            log("本机地址 \(ip)。v1.1 监听模式：等仪表连入，不主动拨出。")
+        } else {
+            log("⚠️ 暂时没拿到 Wi-Fi 地址。监听仍会开启，但请确认已连上仪表热点（kt_ap_xxxxxx），"
+                + "否则仪表连不进来。")
+        }
         startMirrorListeners()
-        connectControl()
+        startControlListener()
     }
 
     private func stopLocked() {
         isRunning = false
-        // 让尚未触发的「3 秒兜底」失效，避免旧会话往新连接发帧。
+        // 让尚未触发的定时任务失效，避免旧会话往新连接发帧。
         controlGeneration += 1
         for listener in listeners.values { listener.cancel() }
         listeners.removeAll()
+        controlListener?.cancel(); controlListener = nil
         for mirror in mirrors.values { mirror.cancel() }
         mirrors.removeAll()
         control?.cancel(); control = nil
@@ -185,114 +190,183 @@ final class CarbitLinkOutput {
         }
     }
 
-    // MARK: - 控制通道（PXC，拨出）
+    // MARK: - 控制通道（PXC，v1.1 改为监听 10922）
+    //
+    // 【v1.1 方向定案】原厂 App 会话（easyride-log/ec_pid.txt 实测）：
+    //   `PXCService: listening client {…localport=10922}` → `accept pxc` ×4
+    //   → `PXCForCar-C2P: receive <<< 0x00010010:ECP_C2P_CLIENT_INFO`
+    // 即：**手机监听、仪表拨入、仪表先发**。
+    // v0.1~v1.0 十版都反着做（手机拨 10930 并抢先发 0x00010010），
+    // 所以每版都收到 `0x70000011 {"status":false}`（对未识别命令的 NAK）后 RST。
 
-    private func connectControl() {
-        guard isRunning else { return }
-        guard let port = NWEndpoint.Port(rawValue: config.controlPort) else { return }
-        let connection = NWConnection(host: NWEndpoint.Host(config.host), port: port, using: .tcp)
+    private func startControlListener() {
+        let port = config.controlListenPort
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            log("控制端口 \(port) 非法")
+            return
+        }
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        let listener: NWListener
+        do {
+            listener = try NWListener(using: parameters, on: nwPort)
+        } catch {
+            log("无法监听控制端口 \(port)：\(error.localizedDescription)")
+            return
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self, self.isRunning else { connection.cancel(); return }
+            self.acceptControl(connection)
+        }
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            if case .failed(let error) = state {
+                self.log("控制端口 \(port) 监听失败：\(error.localizedDescription)")
+            }
+        }
+        listener.start(queue: queue)
+        controlListener = listener
+        log("已在 \(port) 监听（PXC 控制口），等仪表连入")
+    }
+
+    private func acceptControl(_ connection: NWConnection) {
         control = connection
+        controlGeneration += 1
+        let generation = controlGeneration
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, self.control === connection else { return }
             switch state {
             case .ready:
                 self.controlReady = true
-                self.log("控制通道已连上 \(self.config.host):\(self.config.controlPort) ★")
                 self.setConnected(true)
-                self.beginControlSession()
+                self.beginControlSession(generation: generation)
             case .failed(let error):
-                self.log("控制通道失败：\(error.localizedDescription)")
+                self.log("[ctl] 控制通道失败：\(error.localizedDescription)")
                 connection.cancel()
-            case .waiting(let error):
-                self.log("控制通道等待中：\(error.localizedDescription)")
+            case .cancelled:
+                self.controlReady = false
+                if self.control === connection { self.control = nil }
+                self.setConnected(false)
             default:
                 break
             }
         }
         connection.start(queue: queue)
-        queue.asyncAfter(deadline: .now() + 8) { [weak self] in
-            guard let self, self.control === connection, !self.controlReady else { return }
-            self.log("控制通道 8 秒未就绪")
-            connection.cancel()
-        }
     }
 
-    private func beginControlSession() {
-        // 【v1.0】dump(5) 实证车机在 10930 上从不主动发首帧 → 连上立即发。
-        // PLT→GOT 铁证：首帧命令码必须是 0x00010010（handleClientInfo），
-        // 前 9 版用的 0x000103F0 是 handleOpenPage，载荷从未被解析。
-        log("控制通道就绪：v1.0 立即上报 CLIENT_INFO 0x00010010（handleClientInfo，非 handleOpenPage）")
-        if let connection = control {
-            receive(on: connection, tag: "ctl")
-        }
-        sendProactiveClientInfo()
+    /// 【v1.1】连上后**不发任何帧**，只挂接收。
+    /// 原厂时序：仪表连入后约 50ms 就发 `0x00010010`，我方等它即可。
+    private func beginControlSession(generation: Int) {
+        guard let connection = control else { return }
+        log("[ctl] 仪表已连入控制通道，v1.1 静默等待它下发 CLIENT_INFO（不自报）")
+        receive(on: connection, tag: "ctl")
 
-        // 保留一次兜底：仅当立即发送因 RSA 身份未就绪等原因没发成时重试。
-        // didSendProactiveInfo 已置位时这里直接返回，不会重复发帧。
-        let generation = controlGeneration
+        // 超时只提示，**不兜底发帧**——主动发就是 v1.0 那个错误。
         let wait = config.carInfoWaitSeconds
         queue.asyncAfter(deadline: .now() + wait) { [weak self] in
-            guard let self = self, self.isRunning, self.controlGeneration == generation else { return }
-            if self.didReplyToCarInfo || self.didSendProactiveInfo { return }
-            self.sendProactiveClientInfo()
+            guard let self, self.isRunning, self.controlGeneration == generation else { return }
+            if self.didCompleteHandshake { return }
+            self.log("⚠️ \(Int(wait)) 秒内没收到仪表 CLIENT_INFO（0x00010010）。"
+                + "查：仪表是否真的主动连入、端口 10922 是否被占用。")
         }
     }
 
-    /// 【v1.0】连上 10930 立即上报：0x00010010（handleClientInfo）+ 原厂身份 + RSA 凭证。
-    private func sendProactiveClientInfo() {
-        guard let identity = identity else {
-            log("⚠️ 无 RSA 身份，CLIENT_INFO 未发送（等待兜底重试）")
+    /// 【v1.1】收到仪表下发的 `0x00010010` 后的完整应答序列。
+    /// 顺序照搬原厂 logcat 的 `PXCForCar-P2C: process >>>` 时序：
+    /// 能力应答 → 启动音频(0x20490) → 屏幕信息(0x20020) → 音频状态(0x20310)
+    /// → 缓冲控制(0x20050) → 请求开始镜像(0x201C0)。
+    private func handleCarClientInfo(_ payload: Data, on connection: NWConnection) {
+        guard !didCompleteHandshake else {
+            log("[ctl] 已握手过，忽略重复的 CLIENT_INFO")
             return
         }
-        didSendProactiveInfo = true
-        let who = config.clientIdentity
-        let encrypted: String
-        do {
-            encrypted = try identity.encryptedHUID(who.huid)
-        } catch {
-            log("⚠️ HUID 加密失败：\(error.localizedDescription)")
+        guard let cap = CarbitLinkWire.parseCarCapability(payload) else {
+            log("[ctl] ⚠️ 0x00010010 载荷解析不出能力位（channel/flavor 都空），原始字节已转储")
             return
         }
-        let info = CarbitLinkWire.clientInfoJSON(
-            identity: who,
-            pubkey: identity.publicKeyBase64, encryptedHUID: encrypted
-        )
-        log("上报 CLIENT_INFO 0x00010010（channel=\(who.channel) phoneUUID=\(who.phoneUUID)）："
-            + "\(String(data: info, encoding: .utf8) ?? "-")")
-        if let frame = try? CarbitLinkWire.pxcFrame(cmd: CarbitLinkWire.PXC.clientInfo, payload: info) {
-            send(frame, on: control, tag: "ctl")
-        }
+        didCompleteHandshake = true
+
+        log("★ 收到仪表 CLIENT_INFO：HUID=\(cap.huid) HUName=\(cap.huName) "
+            + "channel=\(cap.channel) flavor=\(cap.flavor) sdk=\(cap.sdkVersion) "
+            + "productType=\(cap.productType) supportConnect=\(cap.supportConnect) "
+            + "mirror=\(cap.supportScreenMirroring) touch=\(cap.supportScreenTouch) "
+            + "mirrorMode=\(cap.mirrorMode)")
+
+        // 1. 能力应答：仪表声明什么就回什么，channel 保持字符串。
+        sendOptional(CarbitLinkWire.PXC.carClientInfoReply,
+                     payload: capabilityReplyJSON(cap), on: connection,
+                     note: "能力应答 0x00010011")
+
+        // 2. 启动音频
+        sendOptional(CarbitLinkWire.PXC.startAudio, payload: nil, on: connection,
+                     note: "启动音频 0x00020490")
+
+        // 3. 屏幕信息
+        let screen = Self.phoneScreenSize()
+        let screenJSON = CarbitLinkWire.phoneScreenJSON(
+            displayRotation: 0, width: screen.width, height: screen.height,
+            enableAccessibility: false)
+        sendOptional(CarbitLinkWire.PXC.screenInfo, payload: screenJSON, on: connection,
+                     note: "屏幕信息 0x00020020（\(screen.width)×\(screen.height)）")
+
+        // 4. 音频状态
+        sendOptional(CarbitLinkWire.PXC.audioStatus,
+                     payload: CarbitLinkWire.audioStatusJSON(isMute: false, isLogin: false),
+                     on: connection, note: "音频状态 0x00020310")
+
+        // 5. 缓冲控制
+        sendOptional(CarbitLinkWire.PXC.queueControl, payload: nil, on: connection,
+                     note: "缓冲控制 0x00020050")
+
+        // 6. 请求开始镜像
+        sendOptional(CarbitLinkWire.PXC.requestStartMirror, payload: nil, on: connection,
+                     note: "请求开始镜像 0x000201C0")
+
+        log("[ctl] 握手序列已发完。等镜像通道（10920）连入并下发 0x0010 采集参数。")
     }
 
-    /// 收到车机下发的 CLIENT_INFO → 回 0x00010011（u0() 字段集）。
-    /// 【v0.9】若已经主动上报过，就不再回，避免一会话发两帧。
-    private func replyToCarClientInfo(_ carHUID: String, channel: String, flavor: Int,
-                                     sdkVersion: String, on connection: NWConnection,
-                                     requestCode: UInt32) {
-        guard !didReplyToCarInfo, !didSendProactiveInfo, let identity = identity else {
-            log("⚠️ 无 RSA 身份 / 已应答 / 已主动上报，跳过 CLIENT_INFO 应答")
-            return
-        }
-        didReplyToCarInfo = true
+    /// 能力应答载荷。仪表声明什么就回什么。
+    private func capabilityReplyJSON(_ cap: CarbitLinkWire.CarCapability) -> Data {
         let who = config.clientIdentity
-        let encrypted: String
-        do {
-            encrypted = try identity.encryptedHUID(carHUID)
-        } catch {
-            log("⚠️ 车机 HUID 加密失败：\(error.localizedDescription)")
+        let object: [String: Any] = [
+            "sdkVersion": who.sdkVersion,
+            "pxcVersion": who.pxcVersion,
+            "flavor": cap.flavor != 0 ? cap.flavor : who.flavor,
+            // ★ 原厂是字符串 "44001"，不是整数。
+            "channel": cap.channel.isEmpty ? String(who.channel) : cap.channel,
+            "HUID": cap.huid,
+            "HUName": who.huName,
+            "phoneUUID": who.phoneUUID,
+            "phoneBrand": who.phoneBrand,
+            "phoneModel": who.phoneModel,
+            "phoneOs": who.phoneOs,
+            "phoneOsVersion": who.phoneOsVersion,
+            "package_name": who.packageName,
+            "versionCode": who.versionCode,
+            "screenType": 1,
+            "productType": cap.productType != 0 ? cap.productType : 3,
+            "supportFunction": who.action,
+            "supportMic": false,
+            "supportBackDesktop": true,
+            "wakeupWord": ""
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
+    }
+
+    /// 发一帧 PXC；失败只记日志，不中断后续步骤。
+    private func sendOptional(_ cmd: UInt32, payload: Data?, on connection: NWConnection, note: String) {
+        let body = payload ?? Data()
+        guard let frame = try? CarbitLinkWire.pxcFrame(cmd: cmd, payload: body) else {
+            log("[ctl] ⚠️ \(note) 组包失败")
             return
         }
-        let reply = CarbitLinkWire.clientInfoReplyJSON(
-            identity: who, carHUID: carHUID,
-            pubkey: identity.publicKeyBase64, encryptedHUID: encrypted
-        )
-        let replyCode = CarbitLinkWire.PXC.carClientInfoReply
-        log("★ 收到车机 CLIENT_INFO（cmd=0x\(String(format: "%08X", requestCode))，"
-            + "HUID=\(carHUID) channel=\(channel) flavor=\(flavor) sdk=\(sdkVersion)）"
-            + " → 回 0x\(String(format: "%08X", replyCode))：\(String(data: reply, encoding: .utf8) ?? "-")")
-        if let frame = try? CarbitLinkWire.pxcFrame(cmd: replyCode, payload: reply) {
-            send(frame, on: connection, tag: "ctl")
-        }
+        log("[ctl] 发送 \(note)，\(body.count) 字节载荷")
+        send(frame, on: connection, tag: "ctl")
+    }
+
+    /// 手机屏幕像素尺寸。原厂实测 1440×3200，与真机一致时直接可用。
+    static func phoneScreenSize() -> (width: Int, height: Int) {
+        (1440, 3200)
     }
 
     /// 【v0.9】原厂 App 的 phoneUUID（logcat `phoneUUID : 45f68d78-…`）。
@@ -397,6 +471,13 @@ final class CarbitLinkOutput {
             log("[\(tag)] 视频通道就绪（0x0070）")
         case .frameRequest:
             pumpFrameIfPossible()
+        case .carClientInfo(let payload):
+            // 【v1.1】仪表在控制通道下发的 CLIENT_INFO —— 真正握手的起点。
+            guard tag == "ctl" else {
+                log("[\(tag)] 非控制通道收到 carClientInfo，忽略")
+                return
+            }
+            handleCarClientInfo(payload, on: connection)
         case .heartbeat(let code, let framing):
             // 心跳应答码未实测（TODO probe）：先按同一通道原样回显。
             if framing == .pxc {
@@ -414,17 +495,16 @@ final class CarbitLinkOutput {
             let raw = String(data: payload, encoding: .utf8) ?? ""
             let flat = raw.filter { !$0.isWhitespace }
 
-            // 【v1.0】握手判据：按命令码直接判定，不依赖载荷是否为 JSON。
+            // 【v1.1】判据按真实方向重写：
+            //   收 0x00010010 → 仪表能力通告（已由 .carClientInfo 事件单独处理）
+            //   收 0x70000011 → 仪表对未识别命令的 NAK（说明我方发错了码）
             switch code {
-            case CarbitLinkWire.PXC.clientInfoAck:
-                log("✅ 握手推进：车机 handleClientInfo 回了 0x00010011（成功）→ CLIENT_INFO 已被解析")
+            case CarbitLinkWire.PXC.unsupportedNack:
+                log("⚠️ 仪表回了 0x70000011 NAK（{\"status\":false}）："
+                    + "说明我方发了它不认识的命令码。v1.1 不应再出现——"
+                    + "若出现，查是否还有 0x0001xxxx 段的主动发送。")
             case CarbitLinkWire.PXC.clientInfoNack:
-                log("⚠️ 车机 handleClientInfo 回了 0x80000030：载荷已被解析，"
-                    + "但 flavor/channel 缺失或 checkPermission 不过（字段问题，静态可再查）")
-            case CarbitLinkWire.PXC.clientInfoReply where flat.contains("\"status\":false"):
-                log("⚠️ 仍是 0x70000011 {\"status\":false}。v1.0 已把首帧改成 0x00010010"
-                    + "（handleClientInfo）；该帧在手机 APK 内无生成点、出自仪表固件，"
-                    + "属仪表侧授权状态机 → 纯侧载无法自证，到此收敛，不再迭代协议。")
+                log("⚠️ 仪表回了 0x80000030：载荷进门但 flavor/channel 校验不过。")
             default:
                 break
             }
@@ -432,17 +512,6 @@ final class CarbitLinkOutput {
             if payload.first == UInt8(ascii: "{"),
                let json = String(data: payload, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !json.isEmpty {
                 text += "  JSON: \(json)"
-                // 【v0.8 被动路径】车机下发的 CLIENT_INFO 一定带 HUID；
-                // {"status":false} 不含 HUID，ack/nack 也不走被动路径。
-                if code != CarbitLinkWire.PXC.clientInfoAck,
-                   code != CarbitLinkWire.PXC.clientInfoNack,
-                   let car = CarbitLinkWire.parseCarClientInfo(payload) {
-                    log(text)
-                    replyToCarClientInfo(car.huid, channel: car.channel, flavor: car.flavor,
-                                         sdkVersion: car.sdkVersion, on: connection,
-                                         requestCode: code)
-                    return
-                }
             }
             log(text)
         }
