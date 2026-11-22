@@ -77,29 +77,56 @@ final class CarbitLinkWire {
 
     /// 两条通道各自一套帧头。
     enum Framing {
-        /// 控制通道（10930）：16 字节头。
+        /// 控制通道（10922）：16 字节头。
         case pxc
-        /// 镜像通道（10920/10921/10922）：8 字节头。
+        /// 镜像通道（10920/10921）：8 字节头。
         case mirror
     }
 
     /// PXC 控制通道指令（32 位）。低 16 位是操作码，高 16 位是服务号。
+    ///
+    /// 【v1.1 方向定案 —— dump(7) + 原厂 logcat 双证】
+    /// `C2P` = Car → Phone（仪表发给手机），`P2C` = Phone → Car。
+    /// 原厂实测（easyride-log/ec_pid.txt，整场会话统计）：
+    ///   收：仅 `0x00010010 ECP_C2P_CLIENT_INFO`  ×2
+    ///   发：`0x00020030` ×94 / `0x00020020` ×47 / `0x000201D0` ×3 /
+    ///       `0x00020050` ×3 / `0x00020310` ×2 / `0x00020490` ×2 /
+    ///       `0x000204B0` ×2 / `0x000201C0` ×1
+    /// 即：**手机只收 0x0001xxxx，只发 0x0002xxxx**。
+    /// v0.1~v1.0 十版都把 `0x00010010` 当手机上报帧主动发出去，方向反了，
+    /// 仪表按「未识别命令」回 `0x70000011 {"status":false}` 并 RST。
     enum PXC {
-        /// 【v1.0 核心修正】手机 → 车机：CLIENT_INFO。
-        /// C2PMainService::handleCMD case 0x00010010 → PLT 0x3706e0
-        /// → GOT 0x3b21b8 → C2PMainService::handleClientInfo。
-        /// 前 9 版误用 0x000103F0（handleOpenPage），载荷从未被解析。
-        static let clientInfo: UInt32 = 0x00010010
-
-        /// 车机 → 手机：handleClientInfo 成功应答（请求码 +1，0x1beee4 构造）。
-        static let clientInfoAck: UInt32 = 0x00010011
-        /// 车机 → 手机：handleClientInfo 失败应答（JSON 格式错 /
-        /// flavor|channel 缺失 / checkPermission 不过），0x1bef0c 构造 0x80000030。
-        static let clientInfoNack: UInt32 = 0x80000030
-
-        /// 兼容 v0.8 被动路径命名（车机下发 CLIENT_INFO 请求 / 手机应答）。
-        static let carClientInfoRequest: UInt32 = 0x00010010
+        /// 【仪表 → 手机】CLIENT_INFO 能力通告，手机侧**只收不发**。
+        /// 对应 `C2PMainService::handleClientInfo`（@0x1bebec）在仪表侧被调用。
+        static let carClientInfo: UInt32 = 0x00010010
+        /// 手机 → 仪表：能力应答，`0x00010010 + 1`（handleClientInfo 成功码）。
+        /// 原厂 logcat 里没观测到（手机不回它），保留常量供实验对照。
         static let carClientInfoReply: UInt32 = 0x00010011
+        /// 仪表 → 手机：CLIENT_INFO 失败码（仅当手机错误地发 0x00010010 时出现）。
+        static let clientInfoNack: UInt32 = 0x80000030
+        // MARK: 手机 → 仪表（P2C，0x0002xxxx），全部取自原厂实测
+
+        /// 屏幕信息，载荷是 JSON（含 displayRotation/width/height）。
+        static let screenInfo: UInt32 = 0x00020020
+        /// 屏幕信息（周期性重发版，原厂 94 次，最高频）。
+        static let screenInfoRepeat: UInt32 = 0x00020030
+        /// 队列/缓冲控制（原厂载荷 `rst:0 queue size:N`）。
+        static let queueControl: UInt32 = 0x00020050
+        /// 请求开始镜像。
+        static let requestStartMirror: UInt32 = 0x000201C0
+        /// 请求亿连切到前台。
+        static let requestForeground: UInt32 = 0x000201D0
+        /// 音频状态（载荷 `ismute:false,isLogin:false`）。
+        static let audioStatus: UInt32 = 0x00020310
+        /// 启动音频通道。
+        static let startAudio: UInt32 = 0x00020490
+        /// 触发 ECP_C2P_ENABLE_DOWNLOAD_PHONE_HUD。
+        static let enableDownloadPhoneHud: UInt32 = 0x000204B0
+
+        /// 仪表回给错误命令码的通用 NAK：`0x70000000 | 0x11`。
+        /// `0x70000000` 是 C2PService 服务基址（C2PService::handleCMD @0x1c1b24
+        /// 里有 `mov w9, #0x70000000`），0x11 是状态操作码。
+        static let unsupportedNack: UInt32 = 0x70000011
 
         /// 校验回复码规律：请求 +1。
         static let checkCarUUID: UInt32 = 0x000103B0
@@ -108,22 +135,25 @@ final class CarbitLinkWire {
         /// 【v1.0 留档】0x000103F0 = handleOpenPage，前 9 版误用它发身份包。
         static let openPage: UInt32 = 0x000103F0
         /// v1.0 修正后的 case 表常量（旧表把 0x10010 标成 nightMode 是错的）。
+        /// 属 C2P 段，手机不主动发。
         static let nightMode: UInt32 = 0x00010200
         static let btnEvent: UInt32 = 0x00010350
-        /// 手机 → 仪表：屏幕信息（P2C，P2CMainService::notifyAppStatusChanged）。
-        static let screenInfo: UInt32 = 0x00020020
-        static let requestStartMirror: UInt32 = 0x000201C0
-        /// 仪表 → 手机：准入层 / 非法命令通用拒绝（实车 0x70000011，{"status":false}）。
-        static let clientInfoReply: UInt32 = 0x70000011
     }
 
     /// 镜像通道指令（16 位）。
+    /// 全部取自原厂会话实测（`Protocol: ... sixteenBitSize(1152,640)` 及镜像通道日志）。
     enum MirrorCode: UInt16 {
+        /// 仪表下发采集参数（镜像启动）。
         case start        = 0x0010
+        /// 视频通道就绪。
         case ready        = 0x0070
+        /// 仪表拉帧：每要一帧发一条（拉模式）。
         case frameRequest = 0x0072
+        /// 心跳。
         case heartbeat    = 0x0040
-        case videoFrame   = 0x0071   // TODO(probe)：手机推帧码，暂定
+        /// 手机推帧。原厂反汇编里 `sendCMD` 的推帧分支用 0x71（0x0072 的应答码），
+        /// 属「请求+1」规律；仍标 TODO(probe)，第一次上车以 dump 里是否断流为准。
+        case videoFrame   = 0x0071
     }
 
     // MARK: - 【v0.9】客户端身份（原厂 App 实测值，准入层按 channel+phoneUUID 校验）
@@ -181,6 +211,9 @@ final class CarbitLinkWire {
         case ready
         case frameRequest
         case heartbeat(code: UInt32, framing: Framing)
+        /// 【v1.1】仪表在控制通道下发的 CLIENT_INFO（`0x00010010`），载荷是 JSON。
+        /// 这是手机侧**唯一**该等的握手帧；收到后按原厂字段集回能力 + 发 0x0002xxxx 首帧。
+        case carClientInfo(Data)
         case unknown(code: UInt32, payload: Data, framing: Framing)
     }
 
@@ -232,113 +265,86 @@ final class CarbitLinkWire {
     func videoFrame(annexB: Data) throws -> Data {
         try Self.mirrorFrame(code: MirrorCode.videoFrame.rawValue, payload: annexB)
     }
-
-    /// 【v0.9】主动上报的「合并字段集」CLIENT_INFO。
-    /// 身份字段全部照搬原厂 App（准入层校验 channel + phoneUUID），
-    /// 同时覆盖三套静态证据，避免再靠猜：
-    ///   A. native C2PMainService::handleClientInfo(@0x1bebec) 解析侧 18 字段
-    ///   B. Java ECP_C2P_CLIENT_INFO.u0(Map) 发送侧字段（pxcVersion/pubkey/...）
-    ///   C. 二维码解出的本车参数（modelid / sn / bm / action）
-    /// token 是【整数 0】（u0() 里 JSONObject.put("token", 0)），不是空串。
-    static func clientInfoJSON(
-        identity: ClientIdentity, pubkey: String, encryptedHUID: String
+    /// 【v1.1】手机侧屏幕信息帧（P2C `0x00020020` / `0x00020030`）。
+    /// 字段照搬原厂 logcat：
+    /// `{"displayRotation":0,"width":1440,"height":3200,"enableAccessibility":false,
+    ///   "enableAOAHid…}`（原厂只打印了前 100 字符，实测出现的键都在这里）。
+    /// `width/height` 是**手机屏幕**像素，不是采集分辨率；采集参数走镜像通道。
+    static func phoneScreenJSON(
+        displayRotation: Int, width: Int, height: Int, enableAccessibility: Bool
     ) -> Data {
         let object: [String: Any] = [
-            // A. native 解析侧（原厂身份，非 iOS 自称）
-            "sdkVersion": identity.sdkVersion,
-            "flavor": identity.flavor,
-            "channel": identity.channel,
-            "HUID": identity.huid,
-            "HUName": identity.huName,
-            "encryptedHUID": encryptedHUID,
-            "token": 0,
-            "supportFunction": identity.action,
-            "productType": 0,
-            "supportMic": false,
-            "package_name": identity.packageName,
-            "screenType": 1,
-            "wakeupWord": "",
-            "supportBackDesktop": false,
-            "phoneOs": identity.phoneOs,
-            "phoneOsVersion": identity.phoneOsVersion,
-            "phoneModel": identity.phoneModel,
-            "phoneBrand": identity.phoneBrand,
-            // B. u0() 发送侧
-            "pxcVersion": identity.pxcVersion,
-            "phoneUUID": identity.phoneUUID,
-            "package": identity.packageName,
-            "versionCode": identity.versionCode,
-            "pubkey": pubkey,
-            "bluetoothName": "",
-            "supportH264IFrame": true,
-            "appVersionFingerPrint": "",
-            "speechEngineType": identity.speechEngineType,
-            // C. 二维码真实参数（本车：modelid=44001 sn=ehCs action=128）
-            "modelid": identity.modelId,
-            "sn": identity.sn,
-            "bm": identity.wifiMac,
-            "action": identity.action
+            "displayRotation": displayRotation,
+            "width": width,
+            "height": height,
+            "enableAccessibility": enableAccessibility
         ]
         return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
     }
 
-    /// 【v1.0 保留的被动路径】本车实测车机不主动发 CLIENT_INFO，且 0x00010011
-    /// 实为 handleClientInfo 的【车机→手机】成功应答，正常流程不会调用本函数
-    /// （Output 里 didSendProactiveInfo 已守卫）。若换仪表会主动下发，
-    /// 仍按 ECP_C2P_CLIENT_INFO.u0(Map) 构造。
-    /// `carHUID` 必须用【车机下发的 HUID】——车机拿 pubkey 还原
-    /// encryptedHUID 后要和这个自己发的值比对，填错必被拒。
-    static func clientInfoReplyJSON(
-        identity: ClientIdentity, carHUID: String,
-        pubkey: String, encryptedHUID: String
-    ) -> Data {
-        let object: [String: Any] = [
-            "pxcVersion": identity.pxcVersion,
-            "phoneUUID": identity.phoneUUID,
-            "phoneBrand": identity.phoneBrand,
-            "phoneModel": identity.phoneModel,
-            "phoneOsVersion": identity.phoneOsVersion,
-            "phoneOs": identity.phoneOs,
-            "package": identity.packageName,
-            "versionCode": identity.versionCode,
-            "token": 0,
-            "pubkey": pubkey,
-            "encryptedHUID": encryptedHUID,
-            "bluetoothName": "",
-            "supportH264IFrame": true,
-            "supportFunction": identity.action,
-            "appVersionFingerPrint": "",
-            "speechEngineType": identity.speechEngineType,
-            // 回显车机身份，供 native handleClientInfo 侧校验
-            "HUID": carHUID,
-            "sdkVersion": identity.sdkVersion,
-            "flavor": identity.flavor,
-            "channel": identity.channel
-        ]
+    /// 【v1.1】音频状态帧（P2C `0x00020310`）。
+    /// 原厂载荷原文：`ismute:false,isLogin:false`。
+    static func audioStatusJSON(isMute: Bool, isLogin: Bool) -> Data {
+        let object: [String: Any] = ["ismute": isMute, "isLogin": isLogin]
         return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
     }
 
-    /// 从车机下发的 CLIENT_INFO JSON 里抽 HUID / channel / flavor / sdkVersion。
-    /// HUID 非空才认定是「车机能力通告」，避免把 {"status":false} 误当请求。
-    static func parseCarClientInfo(_ payload: Data) -> (huid: String, channel: String, flavor: Int, sdkVersion: String)? {
+    /// 【v1.1】队列控制帧（P2C `0x00020050`），原厂载荷 `e`，无 JSON 体。
+    /// 这里只返回空体，调用方用 `pxcFrame(cmd:)` 直接组包。
+
+    /// 【v1.1】判断仪表下发的 CLIENT_INFO 里声明的能力。
+    /// 只读我方真正会用到的键；其余 40 个键照原样留在 dump 里备查。
+    struct CarCapability {
+        var huid: String = ""
+        var huName: String = ""
+        /// 原厂是**字符串** `"44001"`，不是整数。
+        var channel: String = ""
+        var flavor: Int = 0
+        var sdkVersion: String = ""
+        var pxcVersion: String = ""
+        var productType: Int = 0
+        /// 原厂 256。决定可用连接方式位图。
+        var supportConnect: Int = 0
+        var supportScreenMirroring: Bool = false
+        var supportScreenTouch: Bool = false
+        var mirrorMode: Int = 0
+        /// 原厂 20（秒）。镜像/控制通道的读超时。
+        var socketTimeoutPeriodWifi: Int = 20
+        /// 原厂 23821，仪表当前运行毫秒数。
+        var currentHUTime: Int = 0
+    }
+
+    /// 解析仪表下发的 `0x00010010` 载荷。
+    /// 与 v1.0 的 `parseCarClientInfo` 的区别：**HUID 非必需**——
+    /// 原厂日志里 `HUName` 是空串、HUID 一定有；但我方只需要能力位，
+    /// 缺 HUID 也要能把 channel/flavor 读出来，别整帧丢掉。
+    static func parseCarCapability(_ payload: Data) -> CarCapability? {
         guard let object = (try? JSONSerialization.jsonObject(with: payload, options: [])) as? [String: Any] else {
             return nil
         }
-        let huid = (object["HUID"] as? String) ?? (object["huid"] as? String) ?? ""
-        guard !huid.isEmpty else { return nil }
-        let channel: String
+        var cap = CarCapability()
+        cap.huid = (object["HUID"] as? String) ?? ""
+        cap.huName = (object["HUName"] as? String) ?? ""
+        // channel 原厂是字符串；老固件可能给数字，两种都收。
         if let text = object["channel"] as? String {
-            channel = text
+            cap.channel = text
         } else if let number = object["channel"] as? NSNumber {
-            channel = number.stringValue
-        } else {
-            channel = ""
+            cap.channel = number.stringValue
         }
-        let flavor = (object["flavor"] as? NSNumber)?.intValue ?? 0
-        let sdkVersion = object["sdkVersion"] as? String ?? ""
-        return (huid, channel, flavor, sdkVersion)
+        cap.flavor = (object["flavor"] as? NSNumber)?.intValue ?? 0
+        cap.sdkVersion = (object["sdkVersion"] as? String) ?? ""
+        cap.pxcVersion = (object["pxcVersion"] as? String) ?? ""
+        cap.productType = (object["productType"] as? NSNumber)?.intValue ?? 0
+        cap.supportConnect = (object["supportConnect"] as? NSNumber)?.intValue ?? 0
+        cap.supportScreenMirroring = (object["supportScreenMirroring"] as? NSNumber)?.boolValue ?? false
+        cap.supportScreenTouch = (object["supportScreenTouch"] as? NSNumber)?.boolValue ?? false
+        cap.mirrorMode = (object["mirrorMode"] as? NSNumber)?.intValue ?? 0
+        cap.socketTimeoutPeriodWifi = (object["socketTimeoutPeriodWifi"] as? NSNumber)?.intValue ?? 20
+        cap.currentHUTime = (object["currentHUTime"] as? NSNumber)?.intValue ?? 0
+        // 至少要能判断出「这是能力通告」：channel 或 flavor 有一个非零。
+        guard !cap.channel.isEmpty || cap.flavor != 0 else { return nil }
+        return cap
     }
-
     // MARK: - 拆包（接收）
 
     func consume(_ data: Data) -> [Event] {
@@ -391,22 +397,28 @@ final class CarbitLinkWire {
     }
 
     /// 低 16 位操作码 → 事件。
-    /// 【v1.0】low16=0x0011 有两种：0x00010011 是 handleClientInfo 成功应答，
-    /// 0x70000011 是仪表固件的通用拒绝帧；都归入 unknown 让上层按 fullCode 判定。
+    ///
+    /// 【v1.1 关键】`low16 == 0x0010` 必须按 `fullCode` 区分两个完全不同的东西：
+    ///   · `0x00010010`：**PXC 控制通道**上仪表下发的 CLIENT_INFO（JSON）→ .carClientInfo
+    ///   · `0x00000010`：**镜像通道**的 start（protobuf MirrorConfig）→ .start
+    /// v1.0 把两者混在同一个 case 里，导致控制通道的 CLIENT_INFO 被当镜像启动帧解析。
     private static func classify(low16: UInt16, fullCode: UInt32, payload: Data, framing: Framing, version: UInt32) -> [Event] {
         switch low16 {
         case 0x0010:
-            // 0x00010010 = handleClientInfo（手机上报 CLIENT_INFO），载荷是 JSON，
-            // 绝不能先喂给 protobuf 解码器。
-            if payload.first == UInt8(ascii: "{") {
-                return [.unknown(code: fullCode, payload: payload, framing: framing)]
+            if framing == .pxc, fullCode == PXC.carClientInfo {
+                // 仪表下发的能力通告：永远是 JSON，绝不能喂 protobuf 解码器。
+                return [.carClientInfo(payload)]
             }
-            let cfg = decodeMirrorConfig(payload)
-            if let cfg { return [.start(cfg)] }
-            return [.start(nil)]
+            if framing == .mirror {
+                let cfg = decodeMirrorConfig(payload)
+                if let cfg { return [.start(cfg)] }
+                return [.start(nil)]
+            }
+            // 控制通道上其它 0x0010 变体：交给上层看原始字节。
+            return [.unknown(code: fullCode, payload: payload, framing: framing)]
         case 0x0011:
             // 0x00010011 = handleClientInfo 成功应答；
-            // 0x70000011 = 仪表固件通用拒绝（{"status":false}）。
+            // 0x70000011 = 仪表对未识别命令的通用 NAK（{"status":false}）。
             return [.unknown(code: fullCode, payload: payload, framing: framing)]
         case MirrorCode.ready.rawValue:
             return [.ready]
