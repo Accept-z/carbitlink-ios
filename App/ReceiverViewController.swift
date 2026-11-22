@@ -576,21 +576,20 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         if let ssid = currentSSID, !ssid.lowercased().hasPrefix("kt_ap") {
             log("⚠️ 当前 Wi-Fi 是「\(ssid)」，不是仪表热点（kt_ap_xxxx）。推算网关很可能是家用路由器，建议先切到仪表热点。")
         }
-        // 没填就从本机 Wi-Fi 地址推网关（192.168.49.2 → 192.168.49.1），少一步手填也少一处手误。
-        if host.isEmpty, let guess = CarbitLinkOutput.suggestedGateway() {
-            host = guess
+        // 【v1.1】不再需要填仪表 IP：方向改成「我方监听 10922 / 10920，仪表拨入」。
+        // 原厂实测（easyride-log/ec_pid.txt）：手机是 ServerSocket 端，仪表主动 accept。
+        // IP 仍然保留在设置里，只用于「诊断」页的端口探测。
+        if !host.isEmpty {
+            UserDefaults.standard.set(host, forKey: "carbitLinkHost")
+        } else if let guess = CarbitLinkOutput.suggestedGateway() {
             carbitHostField.text = guess
-            log("仪表 IP 未填，已按本机网段推断为 \(guess)")
+            log("仪表 IP 未填。v1.1 不再需要它，已按本机网段填 \(guess) 仅供诊断用。")
         }
-        guard !host.isEmpty else {
-            log("亿连输出已开启，但没填仪表 IP。先连上仪表热点，把网关地址（如 192.168.49.1）填进设置。")
-            return
-        }
-        UserDefaults.standard.set(host, forKey: "carbitLinkHost")
         var configuration = CarbitLinkOutput.Configuration()
         configuration.host = host
         carbitLink.start(configuration: configuration)
-        log("亿连输出已启动，目标 \(host)")
+        log("亿连输出已启动（v1.1 监听模式）：等仪表连入 \(configuration.controlListenPort) 与 "
+            + "\(configuration.listenPorts.map(String.init).joined(separator: "/"))")
     }
 
     /// 一键把 dump 甩出去（AirDrop / 发自己 / 存文件），不用翻「文件」App 找。
